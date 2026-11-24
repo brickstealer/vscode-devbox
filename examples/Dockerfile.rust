@@ -1,0 +1,27 @@
+ARG BASE_IMAGE=vscode-devbox
+FROM ${BASE_IMAGE}
+
+ARG RUST_TOOLCHAIN=stable
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ставим rustup под пользователем dev в стандартные /home/dev/.rustup и /home/dev/.cargo,
+# а бинарники пробрасываем в /usr/local/bin, чтобы они работали в неинтерактивном SSH/VS Code
+USER dev
+RUN HOME=/home/dev curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+        | HOME=/home/dev sh -s -- -y --no-modify-path --default-toolchain "${RUST_TOOLCHAIN}" \
+    && . /home/dev/.cargo/env \
+    && rustup component add clippy rustfmt rust-analyzer \
+    && printf '\n[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"\n' >> /home/dev/.bashrc
+
+# Возвращаем USER root для запуска entrypoint.sh (iptables, SmartDNS, sshd)
+USER root
+RUN for bin in /home/dev/.cargo/bin/*; do \
+        ln -sf "$bin" "/usr/local/bin/$(basename "$bin")"; \
+    done

@@ -32,6 +32,7 @@ Docker-окружение на базе `Ubuntu 24.04` для удалённой
 - `smartdns.conf` — конфиг `SmartDNS`, правила `ipset` и секция апстримов по умолчанию.
 - `redsocks.conf` — базовый конфиг `redsocks`.
 - `authorized_keys` — шаблон файла публичных SSH-ключей (ключи также можно передавать через `SSH_PUBLIC_KEY` в `.env`).
+- [`examples/`](examples/README.md) — готовые примеры дочерних `Dockerfile` для добавления тулчейнов **Python**, **Rust**, **Go** и **C/C++** поверх базового образа.
 
 ## Переменные `.env`
 

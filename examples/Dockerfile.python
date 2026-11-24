@@ -1,0 +1,21 @@
+ARG BASE_IMAGE=vscode-devbox
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    pipx \
+    build-essential \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Устанавливаем uv в /usr/local/bin (доступен в неинтерактивных SSH-сессиях и VS Code)
+RUN curl -fsSL https://astral.sh/uv/install.sh \
+    | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+
+# Добавляем ~/.local/bin в интерактивный PATH для pipx и pip --user
+RUN printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> /home/dev/.bashrc
