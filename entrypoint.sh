@@ -16,6 +16,12 @@ is_truthy() {
     esac
 }
 
+log_info() {
+    if is_truthy "${VERBOSE_LOGS:-true}"; then
+        printf '[%s] [entrypoint] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+    fi
+}
+
 validate_ttl() {
     local var_name="$1"
     local ttl="$2"
@@ -106,6 +112,18 @@ get_configured_socks_ip() {
 
 # Возвращает 0, если прокси для redsocks реально сконфигурирован (через .env или вручную в redsocks.conf)
 configure_redsocks_file() {
+    local redsocks_log_info="off"
+    local redsocks_daemon="on"
+    if is_truthy "${VERBOSE_LOGS:-true}"; then
+        redsocks_log_info="on"
+        redsocks_daemon="off"
+    fi
+
+    sed -i \
+        -e "s|^\([[:space:]]*log_info[[:space:]]*=[[:space:]]*\).*|\1${redsocks_log_info};|" \
+        -e "s|^\([[:space:]]*daemon[[:space:]]*=[[:space:]]*\).*|\1${redsocks_daemon};|" \
+        "$REDSOCKS_CONF_FILE"
+
     if [ -n "${SOCKS_PROXY_HOST:-}" ]; then
         local socks_ip socks_port socks_type
         socks_ip="$(resolve_ipv4 "$SOCKS_PROXY_HOST")"
@@ -127,6 +145,7 @@ configure_redsocks_file() {
 configure_smartdns_file() {
     local cache_ttl="${1:-}"
     local cache_block=""
+    local log_block=""
     local upstream_block=""
     local tmp_conf
 
@@ -149,23 +168,48 @@ configure_smartdns_file() {
         cache_block="${cache_block}ipset-timeout no"$'\n'
     fi
 
+    if is_truthy "${VERBOSE_LOGS:-true}"; then
+        log_block="log-level info"$'\n'
+        log_block="${log_block}log-console yes"$'\n'
+    else
+        log_block="log-level warn"$'\n'
+        log_block="${log_block}log-console no"$'\n'
+    fi
+    log_block="${log_block}log-file /var/log/smartdns/smartdns.log"$'\n'
+    log_block="${log_block}log-size 128k"$'\n'
+    log_block="${log_block}log-num 2"$'\n'
+
     tmp_conf="$(mktemp)"
-    awk -v block="$cache_block" '
-        BEGIN { in_block = 0; replaced = 0 }
+    awk -v cblock="$cache_block" -v lblock="$log_block" '
+        BEGIN { in_cache = 0; replaced_cache = 0; in_log = 0; replaced_log = 0 }
         /^# --- BEGIN CACHE/ {
             print "# --- BEGIN CACHE (auto-managed from .env) ---"
-            printf "%s", block
+            printf "%s", cblock
             print "# --- END CACHE ---"
-            in_block = 1
-            replaced = 1
+            in_cache = 1
+            replaced_cache = 1
             next
         }
-        /^# --- END CACHE/ { in_block = 0; next }
-        !in_block && /^[[:space:]]*(cache-size|cache-persist|serve-expired|rr-ttl|rr-ttl-reply-max|ipset-timeout)[[:space:]]/ { next }
-        !in_block { print }
+        /^# --- END CACHE/ { in_cache = 0; next }
+        /^# --- BEGIN LOGGING/ {
+            print "# --- BEGIN LOGGING (auto-managed from .env) ---"
+            printf "%s", lblock
+            print "# --- END LOGGING ---"
+            in_log = 1
+            replaced_log = 1
+            next
+        }
+        /^# --- END LOGGING/ { in_log = 0; next }
+        (in_cache || in_log) { next }
+        /^[[:space:]]*(cache-size|cache-persist|serve-expired|rr-ttl|rr-ttl-reply-max|ipset-timeout)[[:space:]]/ { next }
+        /^[[:space:]]*(log-level|log-console|log-file|log-size|log-num)[[:space:]]/ { next }
+        { print }
         END {
-            if (!replaced) {
-                printf "\n# --- BEGIN CACHE (auto-managed from .env) ---\n%s# --- END CACHE ---\n", block
+            if (!replaced_cache) {
+                printf "\n# --- BEGIN CACHE (auto-managed from .env) ---\n%s# --- END CACHE ---\n", cblock
+            }
+            if (!replaced_log) {
+                printf "\n# --- BEGIN LOGGING (auto-managed from .env) ---\n%s# --- END LOGGING ---\n", lblock
             }
         }
     ' "$SMARTDNS_CONF_FILE" > "$tmp_conf" && mv "$tmp_conf" "$SMARTDNS_CONF_FILE"
@@ -405,13 +449,24 @@ EOF
 }
 
 main() {
+    log_info "Starting vscode-devbox initialization (TZ=${TZ:-UTC})..."
+
     # Если локальный volume ./volumes/nvm пустой — копируем туда предсобранный nvm + Node LTS
     if [ ! -f "$NVM_DIR/nvm.sh" ]; then
+        log_info "Initializing empty NVM volume from /opt/nvm-seed..."
         cp -a /opt/nvm-seed/. "$NVM_DIR/"
     fi
 
-    mkdir -p /home/dev/.config /home/dev/.gemini /home/dev/.config/antigravity
-    chown -R dev:dev /workspace /home/dev/.vscode-server /home/dev/.gemini /home/dev/.config /home/dev/.nvm /home/dev/.nuget
+    log_info "Ensuring volume mountpoint permissions (non-recursive)..."
+    mkdir -p /workspace /home/dev/.vscode-server /home/dev/.gemini /home/dev/.config /home/dev/.config/antigravity /home/dev/.nvm /home/dev/.nuget
+    chown dev:dev /workspace 2>/dev/null || true
+    chown dev:dev \
+        /home/dev/.vscode-server \
+        /home/dev/.gemini \
+        /home/dev/.config \
+        /home/dev/.config/antigravity \
+        /home/dev/.nvm \
+        /home/dev/.nuget
 
     # Прокидываем симлинки активной Node в /usr/local/bin для расширений VS Code
     local node_bin_dir
@@ -421,6 +476,9 @@ main() {
         ln -sf "$node_bin_dir/npm" /usr/local/bin/npm
         ln -sf "$node_bin_dir/npx" /usr/local/bin/npx
         [ -f "$node_bin_dir/pnpm" ] && ln -sf "$node_bin_dir/pnpm" /usr/local/bin/pnpm
+        if is_truthy "${VERBOSE_LOGS:-true}"; then
+            log_info "Toolchain ready: node $(/usr/local/bin/node -v 2>/dev/null || echo 'n/a'), npm $(/usr/local/bin/npm -v 2>/dev/null || echo 'n/a'), dotnet $(dotnet --version 2>/dev/null || echo 'n/a')"
+        fi
     fi
 
     if [ -n "${TZ:-}" ] && [ -f "/usr/share/zoneinfo/$TZ" ]; then
@@ -439,6 +497,13 @@ EOF
 
     configure_ssh_keys
     configure_git
+    if is_truthy "${VERBOSE_LOGS:-true}"; then
+        local ssh_key_count=0
+        if [ -f "$SSH_AUTH_KEYS_FILE" ]; then
+            ssh_key_count="$(grep -cve '^[[:space:]]*\(#\|$\)' "$SSH_AUTH_KEYS_FILE" || true)"
+        fi
+        log_info "SSH & Git configured (authorized_keys entries: ${ssh_key_count})"
+    fi
 
     local dns_cache_ttl ipset_ttl
     dns_cache_ttl="$(get_dns_cache_ttl)"
@@ -449,6 +514,7 @@ EOF
     fi
 
     disable_ipv6
+    log_info "IPv6 disabled via sysctl and ip6tables"
     ensure_smartdns_group
 
     # Снимаем старый DNS-перехват на случай повторного запуска скрипта до подъёма SmartDNS
@@ -460,22 +526,39 @@ EOF
             echo "Error: PROXY_ENABLED=true, but no SOCKS proxy is configured. Set SOCKS_PROXY_HOST in .env (or ip in redsocks.conf), or set PROXY_ENABLED=false." >&2
             return 1
         fi
-        echo "Setting up selective proxy rules (ipset TTL: ${ipset_ttl}s, DNS TTL: ${dns_cache_ttl}s)..."
+        local active_socks_ip active_socks_port active_socks_type
+        active_socks_ip="$(read_redsocks_value ip)"
+        active_socks_port="$(read_redsocks_value port)"
+        active_socks_type="$(read_redsocks_value type)"
+        log_info "Setting up selective proxy rules (${active_socks_type}://${active_socks_ip}:${active_socks_port}, ipset TTL: ${ipset_ttl}s, DNS TTL: ${dns_cache_ttl}s)..."
         setup_proxy_iptables "$ipset_ttl"
-        echo "✓ Proxy rules configured successfully"
-        pgrep -x redsocks >/dev/null || redsocks -c "$REDSOCKS_CONF_FILE"
+        redsocks -t -c "$REDSOCKS_CONF_FILE"
+        if ! pgrep -x redsocks >/dev/null; then
+            if is_truthy "${VERBOSE_LOGS:-true}"; then
+                redsocks -c "$REDSOCKS_CONF_FILE" &
+                sleep 0.1
+            else
+                redsocks -c "$REDSOCKS_CONF_FILE"
+            fi
+        fi
         if ! pgrep -x redsocks >/dev/null; then
             echo "Error: redsocks failed to start" >&2
             return 1
         fi
+        log_info "✓ Proxy rules and redsocks active"
     else
         cleanup_proxy_iptables
-        echo "Selective proxy disabled (PROXY_ENABLED=false) — skipping redsocks/iptables"
+        log_info "Selective proxy disabled (PROXY_ENABLED=false) — skipping redsocks/iptables"
     fi
 
     # --- DNS (SmartDNS: читает smartdns.conf, либо применяет переменные из .env) ---
     configure_smartdns_file "$dns_cache_ttl"
     mkdir -p /var/log/smartdns
+    if is_truthy "${VERBOSE_LOGS:-true}"; then
+        local proxy_domains_count=0
+        proxy_domains_count="$(grep -cE '^[[:space:]]*ipset[[:space:]]+/.+/special_proxy' "$SMARTDNS_CONF_FILE" || true)"
+        log_info "Starting SmartDNS (cache: ${DNS_CACHE_ENABLED:-true}, domains in special_proxy: ${proxy_domains_count})..."
+    fi
     if ! pgrep -x smartdns >/dev/null; then
         setpriv --regid="$SMARTDNS_GROUP" --clear-groups smartdns -c "$SMARTDNS_CONF_FILE" -p "$SMARTDNS_PID_FILE"
     fi
@@ -484,16 +567,25 @@ EOF
         return 1
     fi
     echo "nameserver 127.0.0.1" > /etc/resolv.conf
+    log_info "✓ SmartDNS active on 127.0.0.1:53"
 
     if is_truthy "${DNS_FORCE_REDIRECT:-true}"; then
-        echo "Setting up forced DNS interception and DoT/DoH guard..."
+        log_info "Setting up forced DNS interception and DoT/DoH guard..."
         setup_dns_iptables
-        echo "✓ Forced DNS rules configured successfully"
+        log_info "✓ Forced DNS rules configured successfully"
+    else
+        log_info "Forced DNS interception disabled (DNS_FORCE_REDIRECT=false)"
     fi
 
     mkdir -p /run/sshd
-    ssh-keygen -A
-    exec /usr/sbin/sshd -D
+    if is_truthy "${VERBOSE_LOGS:-true}"; then
+        ssh-keygen -A
+        log_info "Initialization complete — starting OpenSSH server on port 22"
+        exec /usr/sbin/sshd -D -e
+    else
+        ssh-keygen -A >/dev/null
+        exec /usr/sbin/sshd -D
+    fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

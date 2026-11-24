@@ -20,6 +20,8 @@ Docker-окружение на базе `Ubuntu 24.04` для удалённой
   - `iptables` заворачивает TCP-трафик для IP из `special_proxy` в `redsocks` (`127.0.0.1:12345`) в обход локальных подсетей и блокирует (`REJECT`) весь исходящий `UDP` (QUIC, WebRTC и др.) к этим IP, исключая утечки мимо SOCKS.
   - IPv6 полностью блокируется в контейнере через `sysctls` и `ip6tables` (`IPV6_BLOCK`), чтобы трафик не обходил правила IPv4.
   - Работает в режиме **fail-closed**: если `PROXY_ENABLED=true`, но `SOCKS_PROXY_HOST` (или `ip` в `redsocks.conf`) не настроен либо `redsocks` не запустился, контейнер завершается с ошибкой вместо тихого пропуска трафика напрямую.
+- **Логирование (`VERBOSE_LOGS`):**
+  - По умолчанию (`VERBOSE_LOGS=true`) в `docker logs` выводятся подробные шаги инициализации контейнера, входы/отключения `sshd` (`-e`), запросы и ответы `SmartDNS` (`log-console yes`, `log-level info`) и проксируемые соединения `redsocks`. При `VERBOSE_LOGS=false` подробный вывод полностью отключается.
 
 ## Структура
 
@@ -41,6 +43,7 @@ Docker-окружение на базе `Ubuntu 24.04` для удалённой
 | `CONTAINER_NAME` | `vscode-devbox` | Имя контейнера Docker |
 | `WORKSPACE_PATH` | `./workspace` | Путь к каталогу проектов на хосте, монтируемому в `/workspace` |
 | `TZ` | `UTC` | Часовой пояс внутри контейнера |
+| `VERBOSE_LOGS` | `true` | Подробные логи старта, `sshd`, `SmartDNS` и `redsocks` в `docker logs` (`true` / `false`) |
 | `SSH_BIND_IP` | `127.0.0.1` | Адрес на хосте для публикации SSH-порта |
 | `SSH_PORT` | `2222` | Порт на хосте для подключения по SSH |
 | `SSH_PUBLIC_KEY` | *(пусто)* | Публичный SSH-ключ, автоматически добавляемый в `/home/dev/.ssh/authorized_keys` |
