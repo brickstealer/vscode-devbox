@@ -80,7 +80,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL "https://github.com/pymumu/smartdns/releases/download/${SMARTDNS_RELEASE}/smartdns.${SMARTDNS_VERSION}.${SMARTDNS_ARCH}-debian-all.deb" -o /tmp/smartdns.deb \
     && echo "${SMARTDNS_SHA256}  /tmp/smartdns.deb" | sha256sum -c - \
     && dpkg -i /tmp/smartdns.deb \
-    && rm -f /tmp/smartdns.deb
+    && rm -f /tmp/smartdns.deb \
+    && (getent group smartdns >/dev/null 2>&1 || groupadd -r smartdns)
 
 COPY authorized_keys /home/dev/.ssh/authorized_keys
 COPY smartdns.conf /etc/smartdns/smartdns.conf

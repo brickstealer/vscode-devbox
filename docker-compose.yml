@@ -11,6 +11,9 @@ services:
       - UPSTREAM_DNS=${UPSTREAM_DNS:-}
       - "DNS_ENCRYPTED_SERVERS=${DNS_ENCRYPTED_SERVERS:-}"
       - DNS_ENCRYPTED_VIA_SOCKS=${DNS_ENCRYPTED_VIA_SOCKS:-false}
+      - DNS_CACHE_ENABLED=${DNS_CACHE_ENABLED:-true}
+      - DNS_CACHE_TTL=${DNS_CACHE_TTL:-300}
+      - DNS_FORCE_REDIRECT=${DNS_FORCE_REDIRECT:-true}
       - PROXY_ENABLED=${PROXY_ENABLED:-true}
       - SOCKS_PROXY_HOST=${SOCKS_PROXY_HOST:-}
       - SOCKS_PROXY_PORT=${SOCKS_PROXY_PORT:-10808}
@@ -18,6 +21,9 @@ services:
       - "PROXY_EXTRA_DOMAINS=${PROXY_EXTRA_DOMAINS:-}"
     cap_add:
       - NET_ADMIN
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
     extra_hosts:
       - "host.docker.internal:host-gateway"
     dns:

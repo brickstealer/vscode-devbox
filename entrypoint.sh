@@ -6,6 +6,7 @@ GIT_CONFIG_FILE="${GIT_CONFIG_FILE:-/home/dev/.gitconfig}"
 SSH_AUTH_KEYS_FILE="${SSH_AUTH_KEYS_FILE:-/home/dev/.ssh/authorized_keys}"
 SMARTDNS_CONF_FILE="${SMARTDNS_CONF_FILE:-/etc/smartdns/smartdns.conf}"
 SMARTDNS_PID_FILE="${SMARTDNS_PID_FILE:-/run/smartdns.pid}"
+SMARTDNS_GROUP="${SMARTDNS_GROUP:-smartdns}"
 REDSOCKS_CONF_FILE="${REDSOCKS_CONF_FILE:-/etc/redsocks.conf}"
 
 is_truthy() {
@@ -13,6 +14,15 @@ is_truthy() {
         true|TRUE|1|yes|YES) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+get_dns_cache_ttl() {
+    local ttl="${DNS_CACHE_TTL:-300}"
+    if [[ ! "$ttl" =~ ^[1-9][0-9]*$ ]] || [ "$ttl" -gt 2147483 ]; then
+        echo "Error: DNS_CACHE_TTL must be an integer between 1 and 2147483 seconds (got '${ttl}'). To disable DNS cache, set DNS_CACHE_ENABLED=false." >&2
+        return 1
+    fi
+    printf '%s\n' "$ttl"
 }
 
 configure_ssh_keys() {
@@ -100,8 +110,58 @@ configure_redsocks_file() {
 }
 
 configure_smartdns_file() {
+    local cache_ttl="${1:-}"
+    local cache_block=""
     local upstream_block=""
     local tmp_conf
+
+    if [ -z "$cache_ttl" ]; then
+        cache_ttl="$(get_dns_cache_ttl)"
+    fi
+
+    if is_truthy "${DNS_CACHE_ENABLED:-true}"; then
+        cache_block="cache-size 4096"$'\n'
+        cache_block="${cache_block}cache-persist no"$'\n'
+        cache_block="${cache_block}serve-expired no"$'\n'
+        cache_block="${cache_block}rr-ttl ${cache_ttl}"$'\n'
+        cache_block="${cache_block}rr-ttl-reply-max ${cache_ttl}"$'\n'
+        cache_block="${cache_block}ipset-timeout yes"$'\n'
+    else
+        cache_block="cache-size 0"$'\n'
+        cache_block="${cache_block}cache-persist no"$'\n'
+        cache_block="${cache_block}serve-expired no"$'\n'
+        cache_block="${cache_block}rr-ttl-reply-max 1"$'\n'
+        cache_block="${cache_block}ipset-timeout no"$'\n'
+    fi
+
+    tmp_conf="$(mktemp)"
+    awk -v block="$cache_block" '
+        BEGIN { in_block = 0; replaced = 0 }
+        /^# --- BEGIN CACHE/ {
+            print "# --- BEGIN CACHE (auto-managed from .env) ---"
+            printf "%s", block
+            print "# --- END CACHE ---"
+            in_block = 1
+            replaced = 1
+            next
+        }
+        /^# --- END CACHE/ { in_block = 0; next }
+        !in_block && /^[[:space:]]*(cache-size|cache-persist|serve-expired|rr-ttl|rr-ttl-reply-max|ipset-timeout)[[:space:]]/ { next }
+        !in_block { print }
+        END {
+            if (!replaced) {
+                printf "\n# --- BEGIN CACHE (auto-managed from .env) ---\n%s# --- END CACHE ---\n", block
+            }
+        }
+    ' "$SMARTDNS_CONF_FILE" > "$tmp_conf" && mv "$tmp_conf" "$SMARTDNS_CONF_FILE"
+
+    if ! grep -Eq '^[[:space:]]*bind-tcp[[:space:]]' "$SMARTDNS_CONF_FILE" 2>/dev/null; then
+        printf '\nbind-tcp 127.0.0.1:53\n' >> "$SMARTDNS_CONF_FILE"
+    fi
+
+    if ! grep -Eq '^[[:space:]]*force-qtype-SOA[[:space:]]' "$SMARTDNS_CONF_FILE" 2>/dev/null; then
+        printf '\nforce-qtype-SOA 64 65\n' >> "$SMARTDNS_CONF_FILE"
+    fi
 
     # Обновляем блок апстримов только если заданы переменные в .env;
     # иначе SmartDNS читает настройки серверов напрямую из smartdns.conf
@@ -168,38 +228,157 @@ configure_smartdns_file() {
     fi
 }
 
-setup_proxy_iptables() {
-    ipset create special_proxy hash:ip timeout 300 -exist
+disable_ipv6() {
+    sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
 
-    # Clean old jumps to avoid duplicates on re-run
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -D OUTPUT -j IPV6_BLOCK 2>/dev/null || true
+        ip6tables -D FORWARD -j IPV6_BLOCK 2>/dev/null || true
+        ip6tables -F IPV6_BLOCK 2>/dev/null || true
+        ip6tables -X IPV6_BLOCK 2>/dev/null || true
+
+        if ip6tables -N IPV6_BLOCK 2>/dev/null; then
+            ip6tables -A IPV6_BLOCK -o lo -j ACCEPT
+            ip6tables -A IPV6_BLOCK -j REJECT
+            ip6tables -I OUTPUT -j IPV6_BLOCK
+            ip6tables -I FORWARD -j IPV6_BLOCK
+        fi
+    fi
+}
+
+cleanup_proxy_iptables() {
     iptables -t nat -D OUTPUT -p tcp -j SPECIAL_PROXY 2>/dev/null || true
     iptables -t nat -D PREROUTING -p tcp -j SPECIAL_PROXY 2>/dev/null || true
-    iptables -D OUTPUT -p udp --dport 443 -m set --match-set special_proxy dst -j REJECT 2>/dev/null || true
-    iptables -D FORWARD -p udp --dport 443 -m set --match-set special_proxy dst -j REJECT 2>/dev/null || true
-
-    # Flush and recreate nat chain
     iptables -t nat -F SPECIAL_PROXY 2>/dev/null || true
     iptables -t nat -X SPECIAL_PROXY 2>/dev/null || true
+
+    iptables -D OUTPUT -p udp -m owner ! --gid-owner "$SMARTDNS_GROUP" -j SPECIAL_PROXY_UDP 2>/dev/null || true
+    iptables -D FORWARD -p udp -j SPECIAL_PROXY_UDP 2>/dev/null || true
+    iptables -F SPECIAL_PROXY_UDP 2>/dev/null || true
+    iptables -X SPECIAL_PROXY_UDP 2>/dev/null || true
+
+    # Legacy single-rule cleanup
+    iptables -D OUTPUT -p udp --dport 443 -m set --match-set special_proxy dst -j REJECT 2>/dev/null || true
+    iptables -D FORWARD -p udp --dport 443 -m set --match-set special_proxy dst -j REJECT 2>/dev/null || true
+}
+
+setup_proxy_iptables() {
+    local cache_ttl="${1:-}"
+    if [ -z "$cache_ttl" ]; then
+        cache_ttl="$(get_dns_cache_ttl)"
+    fi
+
+    cleanup_proxy_iptables
+
+    # Create or atomically update ipset so timeout always matches DNS_CACHE_TTL
+    if ipset list -t special_proxy >/dev/null 2>&1; then
+        ipset destroy special_proxy_tmp 2>/dev/null || true
+        ipset create special_proxy_tmp hash:ip timeout "$cache_ttl"
+        ipset swap special_proxy_tmp special_proxy
+        ipset destroy special_proxy_tmp
+    else
+        ipset create special_proxy hash:ip timeout "$cache_ttl"
+    fi
+
     iptables -t nat -N SPECIAL_PROXY
+    iptables -N SPECIAL_PROXY_UDP
 
     # Exclude local networks
-    iptables -t nat -A SPECIAL_PROXY -d 0.0.0.0/8 -j RETURN
-    iptables -t nat -A SPECIAL_PROXY -d 10.0.0.0/8 -j RETURN
-    iptables -t nat -A SPECIAL_PROXY -d 127.0.0.0/8 -j RETURN
-    iptables -t nat -A SPECIAL_PROXY -d 169.254.0.0/16 -j RETURN
-    iptables -t nat -A SPECIAL_PROXY -d 172.16.0.0/12 -j RETURN
-    iptables -t nat -A SPECIAL_PROXY -d 192.168.0.0/16 -j RETURN
-    iptables -t nat -A SPECIAL_PROXY -d 224.0.0.0/4 -j RETURN
-    iptables -t nat -A SPECIAL_PROXY -d 240.0.0.0/4 -j RETURN
+    local cidr
+    for cidr in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+        iptables -t nat -A SPECIAL_PROXY -d "$cidr" -j RETURN
+        iptables -A SPECIAL_PROXY_UDP -d "$cidr" -j RETURN
+    done
 
-    # Redirect matched TCP traffic to redsocks
+    # Redirect matched TCP traffic to redsocks and reject all UDP (including QUIC/WebRTC) to force TCP fallback
     iptables -t nat -A SPECIAL_PROXY -p tcp -m set --match-set special_proxy dst -j REDIRECT --to-ports 12345
+    iptables -A SPECIAL_PROXY_UDP -p udp -m set --match-set special_proxy dst -j REJECT
 
-    # Apply TCP redirect and block QUIC (UDP 443) for proxied IPs
     iptables -t nat -I OUTPUT -p tcp -j SPECIAL_PROXY
     iptables -t nat -I PREROUTING -p tcp -j SPECIAL_PROXY
-    iptables -I OUTPUT -p udp --dport 443 -m set --match-set special_proxy dst -j REJECT
-    iptables -I FORWARD -p udp --dport 443 -m set --match-set special_proxy dst -j REJECT
+    iptables -I OUTPUT -p udp -m owner ! --gid-owner "$SMARTDNS_GROUP" -j SPECIAL_PROXY_UDP
+    iptables -I FORWARD -p udp -j SPECIAL_PROXY_UDP
+}
+
+ensure_smartdns_group() {
+    getent group "$SMARTDNS_GROUP" >/dev/null 2>&1 || groupadd -r "$SMARTDNS_GROUP"
+}
+
+cleanup_dns_iptables() {
+    iptables -t nat -D OUTPUT -j DNS_REDIRECT 2>/dev/null || true
+    iptables -t nat -F DNS_REDIRECT 2>/dev/null || true
+    iptables -t nat -X DNS_REDIRECT 2>/dev/null || true
+
+    iptables -D OUTPUT -j DNS_GUARD 2>/dev/null || true
+    iptables -F DNS_GUARD 2>/dev/null || true
+    iptables -X DNS_GUARD 2>/dev/null || true
+}
+
+setup_dns_iptables() {
+    local socks_ip
+    socks_ip="$(read_redsocks_value ip)"
+
+    cleanup_dns_iptables
+
+    # Known public DoH resolvers (blocked on 443 for non-smartdns processes so clients fall back to 127.0.0.1:53)
+    ipset create doh_resolvers hash:ip -exist
+    ipset flush doh_resolvers
+    ipset restore -exist <<'EOF'
+add doh_resolvers 1.1.1.1
+add doh_resolvers 1.0.0.1
+add doh_resolvers 1.1.1.2
+add doh_resolvers 1.0.0.2
+add doh_resolvers 1.1.1.3
+add doh_resolvers 1.0.0.3
+add doh_resolvers 104.16.248.249
+add doh_resolvers 104.16.249.249
+add doh_resolvers 8.8.8.8
+add doh_resolvers 8.8.4.4
+add doh_resolvers 9.9.9.9
+add doh_resolvers 9.9.9.10
+add doh_resolvers 9.9.9.11
+add doh_resolvers 149.112.112.112
+add doh_resolvers 149.112.112.10
+add doh_resolvers 149.112.112.11
+add doh_resolvers 208.67.222.222
+add doh_resolvers 208.67.220.220
+add doh_resolvers 208.67.222.123
+add doh_resolvers 208.67.220.123
+add doh_resolvers 94.140.14.14
+add doh_resolvers 94.140.15.15
+add doh_resolvers 94.140.14.140
+add doh_resolvers 94.140.14.141
+add doh_resolvers 185.228.168.9
+add doh_resolvers 185.228.169.9
+add doh_resolvers 185.228.168.168
+add doh_resolvers 185.228.169.168
+add doh_resolvers 77.88.8.8
+add doh_resolvers 77.88.8.1
+add doh_resolvers 194.242.2.2
+EOF
+
+    # Redirect any non-SmartDNS plain DNS (UDP/TCP 53) to local SmartDNS (127.0.0.1:53)
+    # ACCEPT in nat stops further nat processing (including SPECIAL_PROXY) for SmartDNS itself
+    iptables -t nat -N DNS_REDIRECT
+    iptables -t nat -A DNS_REDIRECT -m owner --gid-owner "$SMARTDNS_GROUP" -j ACCEPT
+    iptables -t nat -A DNS_REDIRECT -d 127.0.0.1/32 -j RETURN
+    iptables -t nat -A DNS_REDIRECT -p udp --dport 53 -j REDIRECT --to-ports 53
+    iptables -t nat -A DNS_REDIRECT -p tcp --dport 53 -j REDIRECT --to-ports 53
+    iptables -t nat -I OUTPUT -j DNS_REDIRECT
+
+    # Block external DoT/DoQ (853) and public DoH (443) for all processes except SmartDNS
+    iptables -N DNS_GUARD
+    iptables -A DNS_GUARD -m owner --gid-owner "$SMARTDNS_GROUP" -j RETURN
+    if [ -n "$socks_ip" ] && [ "$socks_ip" != "127.0.0.1" ] && [ "$socks_ip" != "0.0.0.0" ]; then
+        iptables -A DNS_GUARD -d "${socks_ip}/32" -j RETURN
+    fi
+    iptables -A DNS_GUARD -p tcp --dport 853 -j REJECT
+    iptables -A DNS_GUARD -p udp --dport 853 -j REJECT
+    iptables -A DNS_GUARD -p tcp --dport 443 -m set --match-set doh_resolvers dst -j REJECT
+    iptables -A DNS_GUARD -p udp --dport 443 -m set --match-set doh_resolvers dst -j REJECT
+    iptables -I OUTPUT -j DNS_GUARD
 }
 
 main() {
@@ -238,21 +417,51 @@ EOF
     configure_ssh_keys
     configure_git
 
-    # --- Селективный прокси (redsocks + iptables) ---
-    if is_truthy "${PROXY_ENABLED:-true}" && configure_redsocks_file; then
-        echo "Setting up selective proxy rules..."
-        setup_proxy_iptables
+    local dns_cache_ttl
+    dns_cache_ttl="$(get_dns_cache_ttl)"
+
+    disable_ipv6
+    ensure_smartdns_group
+
+    # Снимаем старый DNS-перехват на случай повторного запуска скрипта до подъёма SmartDNS
+    cleanup_dns_iptables
+
+    # --- Селективный прокси (redsocks + iptables, fail-closed при PROXY_ENABLED=true) ---
+    if is_truthy "${PROXY_ENABLED:-true}"; then
+        if ! configure_redsocks_file; then
+            echo "Error: PROXY_ENABLED=true, but no SOCKS proxy is configured. Set SOCKS_PROXY_HOST in .env (or ip in redsocks.conf), or set PROXY_ENABLED=false." >&2
+            return 1
+        fi
+        echo "Setting up selective proxy rules (TTL: ${dns_cache_ttl}s)..."
+        setup_proxy_iptables "$dns_cache_ttl"
         echo "✓ Proxy rules configured successfully"
         pgrep -x redsocks >/dev/null || redsocks -c "$REDSOCKS_CONF_FILE"
+        if ! pgrep -x redsocks >/dev/null; then
+            echo "Error: redsocks failed to start" >&2
+            return 1
+        fi
     else
-        echo "Selective proxy disabled or no SOCKS host configured — skipping redsocks/iptables"
+        cleanup_proxy_iptables
+        echo "Selective proxy disabled (PROXY_ENABLED=false) — skipping redsocks/iptables"
     fi
 
     # --- DNS (SmartDNS: читает smartdns.conf, либо применяет переменные из .env) ---
-    configure_smartdns_file
+    configure_smartdns_file "$dns_cache_ttl"
     mkdir -p /var/log/smartdns
-    pgrep -x smartdns >/dev/null || smartdns -c "$SMARTDNS_CONF_FILE" -p "$SMARTDNS_PID_FILE"
+    if ! pgrep -x smartdns >/dev/null; then
+        setpriv --regid="$SMARTDNS_GROUP" --clear-groups smartdns -c "$SMARTDNS_CONF_FILE" -p "$SMARTDNS_PID_FILE"
+    fi
+    if ! pgrep -x smartdns >/dev/null; then
+        echo "Error: smartdns failed to start" >&2
+        return 1
+    fi
     echo "nameserver 127.0.0.1" > /etc/resolv.conf
+
+    if is_truthy "${DNS_FORCE_REDIRECT:-true}"; then
+        echo "Setting up forced DNS interception and DoT/DoH guard..."
+        setup_dns_iptables
+        echo "✓ Forced DNS rules configured successfully"
+    fi
 
     mkdir -p /run/sshd
     ssh-keygen -A

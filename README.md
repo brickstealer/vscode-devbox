@@ -10,13 +10,16 @@ Docker-окружение на базе `Ubuntu 24.04` для удалённой
   - `nvm v0.40.3`, Node.js LTS и `pnpm` (шаблон в `/opt/nvm-seed`, разворачивается в volume `/home/dev/.nvm` при первом старте; симлинки прокидываются в `/usr/local/bin`)
   - `git`, `curl`, `wget`, `unzip`, `procps` и базовые утилиты
 - **DNS (`SmartDNS`):**
-  - Слушает `127.0.0.1:53`, отключает IPv6 через `force-AAAA-SOA yes`, кэширует ответы и работает с `speed-check-mode none` (чтобы не конфликтовать с проксированием).
+  - Слушает `127.0.0.1:53` (UDP/TCP), отключает IPv6 (`force-AAAA-SOA yes`) и записи `SVCB`/`HTTPS` (`force-qtype-SOA 64 65`), работает с `speed-check-mode none` (чтобы не конфликтовать с проксированием).
+  - Синхронизирует время жизни DNS-кэша и записей `ipset` через `DNS_CACHE_TTL` (по умолчанию `300` сек) и позволяет полностью отключить DNS-кэш через `DNS_CACHE_ENABLED=false`.
+  - При `DNS_FORCE_REDIRECT=true` (по умолчанию) запускается с отдельной группой `smartdns`: `iptables` заворачивает любые сторонние запросы `UDP/TCP 53` в локальный `SmartDNS` и блокирует обход через внешний `DoT/DoQ (853)` и известные публичные `DoH (443)`, оставляя самому `SmartDNS` полный доступ к апстримам и DoH/DoT.
   - Поддерживает обычный DNS (`server`), **DoH** (`https://...`), **DoT** (`tls://...`) и при необходимости маршрутизацию DoH/DoT через SOCKS5 (`DNS_ENCRYPTED_VIA_SOCKS=true`).
-  - Если `UPSTREAM_DNS` и `DNS_ENCRYPTED_SERVERS` в `.env` не заданы, `SmartDNS` просто читает конфигурацию напрямую из `smartdns.conf`.
+  - Если `UPSTREAM_DNS` и `DNS_ENCRYPTED_SERVERS` в `.env` не заданы, `SmartDNS` просто читает конфигурацию апстримов напрямую из `smartdns.conf`.
 - **Селективный прокси (`redsocks` + `iptables` + `ipset`):**
   - `SmartDNS` добавляет IP для доменов из `smartdns.conf` (и `PROXY_EXTRA_DOMAINS`) в `ipset` `special_proxy`.
-  - `iptables` заворачивает TCP-трафик для IP из `special_proxy` в `redsocks` (`127.0.0.1:12345`) в обход локальных подсетей и блокирует QUIC (`UDP/443`).
-  - `redsocks` перенаправляет этот трафик на прокси из `SOCKS_PROXY_HOST` (или напрямую из `redsocks.conf`, если `SOCKS_PROXY_HOST` в `.env` не задан и в конфиге указан не `127.0.0.1`).
+  - `iptables` заворачивает TCP-трафик для IP из `special_proxy` в `redsocks` (`127.0.0.1:12345`) в обход локальных подсетей и блокирует (`REJECT`) весь исходящий `UDP` (QUIC, WebRTC и др.) к этим IP, исключая утечки мимо SOCKS.
+  - IPv6 полностью блокируется в контейнере через `sysctls` и `ip6tables` (`IPV6_BLOCK`), чтобы трафик не обходил правила IPv4.
+  - Работает в режиме **fail-closed**: если `PROXY_ENABLED=true`, но `SOCKS_PROXY_HOST` (или `ip` в `redsocks.conf`) не настроен либо `redsocks` не запустился, контейнер завершается с ошибкой вместо тихого пропуска трафика напрямую.
 
 ## Структура
 
@@ -46,9 +49,12 @@ Docker-окружение на базе `Ubuntu 24.04` для удалённой
 | `UPSTREAM_DNS` | *(пусто; в compose `1.1.1.1`)* | Обычный DNS-сервер (IP); при использовании `DNS_ENCRYPTED_SERVERS` служит `-bootstrap-dns` |
 | `DNS_ENCRYPTED_SERVERS` | *(пусто)* | DoH/DoT серверы через запятую (`https://...`, `tls://...`) |
 | `DNS_ENCRYPTED_VIA_SOCKS` | `false` | Проксировать DoH/DoT-запросы `SmartDNS` через SOCKS5 (`true` / `false`) |
+| `DNS_CACHE_ENABLED` | `true` | Включить локальный DNS-кэш `SmartDNS` (`true` / `false`; при `false` каждый запрос идёт на апстрим) |
+| `DNS_CACHE_TTL` | `300` | Единое время жизни (в секундах) для DNS-кэша `SmartDNS` и записей `ipset special_proxy` |
+| `DNS_FORCE_REDIRECT` | `true` | Принудительный заворот `UDP/TCP 53` в `SmartDNS` и блокировка обхода через внешний `DoT (853)` / публичные `DoH` |
 | `PROXY_EXTRA_DOMAINS` | *(пусто)* | Дополнительные домены для `special_proxy` через запятую |
-| `PROXY_ENABLED` | `true` | Включение селективного проксирования (`true` / `false`) |
-| `SOCKS_PROXY_HOST` | *(пусто)* | IP или хостнейм прокси-сервера для `redsocks` |
+| `PROXY_ENABLED` | `true` | Включение селективного проксирования (`true` / `false`; при `true` требует валидный прокси — *fail-closed*) |
+| `SOCKS_PROXY_HOST` | *(пусто)* | IP или хостнейм прокси-сервера для `redsocks` (обязателен при `PROXY_ENABLED=true`, если не задан в `redsocks.conf`) |
 | `SOCKS_PROXY_PORT` | `10808` | Порт прокси-сервера для `redsocks` |
 | `SOCKS_PROXY_TYPE` | `socks5` | Тип прокси в `redsocks` (`socks5`, `socks4`, `http-connect`) |
 
