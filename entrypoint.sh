@@ -4,8 +4,16 @@ set -e
 NVM_DIR="/home/dev/.nvm"
 GIT_CONFIG_FILE="${GIT_CONFIG_FILE:-/home/dev/.gitconfig}"
 SSH_AUTH_KEYS_FILE="${SSH_AUTH_KEYS_FILE:-/home/dev/.ssh/authorized_keys}"
-DNSMASQ_CONF_FILE="${DNSMASQ_CONF_FILE:-/etc/dnsmasq.conf}"
+SMARTDNS_CONF_FILE="${SMARTDNS_CONF_FILE:-/etc/smartdns/smartdns.conf}"
+SMARTDNS_PID_FILE="${SMARTDNS_PID_FILE:-/run/smartdns.pid}"
 REDSOCKS_CONF_FILE="${REDSOCKS_CONF_FILE:-/etc/redsocks.conf}"
+
+is_truthy() {
+    case "${1:-}" in
+        true|TRUE|1|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 configure_ssh_keys() {
     if [ -n "${SSH_PUBLIC_KEY:-}" ]; then
@@ -55,36 +63,106 @@ resolve_ipv4() {
     local ip
     ip="$(getent ahostsv4 "$target" 2>/dev/null | awk 'NR==1 { print $1 }')"
     if [ -z "$ip" ]; then
-        echo "Error: failed to resolve SOCKS_PROXY_HOST '$target' to an IPv4 address" >&2
+        echo "Error: failed to resolve '$target' to an IPv4 address" >&2
         return 1
     fi
     printf '%s\n' "$ip"
 }
 
-configure_proxy_files() {
-    local socks_ip upstream_dns socks_port socks_type domain rule
-    socks_ip="$(resolve_ipv4 "$SOCKS_PROXY_HOST")"
-    upstream_dns="${UPSTREAM_DNS:-1.1.1.1}"
-    socks_port="${SOCKS_PROXY_PORT:-10808}"
-    socks_type="${SOCKS_PROXY_TYPE:-socks5}"
+read_redsocks_value() {
+    local key="$1"
+    sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\([^;[:space:]]*\).*/\1/p" "$REDSOCKS_CONF_FILE" | head -n 1
+}
 
-    sed -i \
-        -e "s|^\([[:space:]]*ip[[:space:]]*=[[:space:]]*\).*|\1${socks_ip};|" \
-        -e "s|^\([[:space:]]*port[[:space:]]*=[[:space:]]*\).*|\1${socks_port};|" \
-        -e "s|^\([[:space:]]*type[[:space:]]*=[[:space:]]*\).*|\1${socks_type};|" \
-        "$REDSOCKS_CONF_FILE"
+# Возвращает 0, если прокси для redsocks реально сконфигурирован (через .env или вручную в redsocks.conf)
+configure_redsocks_file() {
+    if [ -n "${SOCKS_PROXY_HOST:-}" ]; then
+        local socks_ip socks_port socks_type
+        socks_ip="$(resolve_ipv4 "$SOCKS_PROXY_HOST")"
+        socks_port="${SOCKS_PROXY_PORT:-10808}"
+        socks_type="${SOCKS_PROXY_TYPE:-socks5}"
 
-    sed -i "s|^server=.*|server=${upstream_dns}|" "$DNSMASQ_CONF_FILE"
+        sed -i \
+            -e "s|^\([[:space:]]*ip[[:space:]]*=[[:space:]]*\).*|\1${socks_ip};|" \
+            -e "s|^\([[:space:]]*port[[:space:]]*=[[:space:]]*\).*|\1${socks_port};|" \
+            -e "s|^\([[:space:]]*type[[:space:]]*=[[:space:]]*\).*|\1${socks_type};|" \
+            "$REDSOCKS_CONF_FILE"
+        return 0
+    fi
+
+    # Если в .env SOCKS_PROXY_HOST пустой — читаем redsocks.conf как есть (кроме плейсхолдера 127.0.0.1)
+    local conf_ip
+    conf_ip="$(read_redsocks_value ip)"
+    if [ -n "$conf_ip" ] && [ "$conf_ip" != "127.0.0.1" ] && [ "$conf_ip" != "0.0.0.0" ]; then
+        return 0
+    fi
+    return 1
+}
+
+configure_smartdns_file() {
+    local upstream_block=""
+    local tmp_conf
+
+    # Обновляем блок апстримов только если заданы переменные в .env;
+    # иначе SmartDNS читает настройки серверов напрямую из smartdns.conf
+    if [ -n "${UPSTREAM_DNS:-}" ] || [ -n "${DNS_ENCRYPTED_SERVERS:-}" ]; then
+        local proxy_flag=""
+        local socks_ip socks_port socks_type
+
+        if [ -n "${DNS_ENCRYPTED_SERVERS:-}" ]; then
+            if is_truthy "${DNS_ENCRYPTED_VIA_SOCKS:-false}"; then
+                socks_ip="$(read_redsocks_value ip)"
+                socks_port="$(read_redsocks_value port)"
+                socks_type="$(read_redsocks_value type)"
+                if [ -n "$socks_ip" ] && [ "$socks_ip" != "127.0.0.1" ] && [ "$socks_ip" != "0.0.0.0" ] && [ "$socks_type" = "socks5" ]; then
+                    upstream_block="${upstream_block}proxy-server socks5://${socks_ip}:${socks_port:-10808} -name env_socks"$'\n'
+                    proxy_flag=" -proxy env_socks"
+                else
+                    echo "Warning: DNS_ENCRYPTED_VIA_SOCKS=true, but no active SOCKS5 proxy is configured; using direct DoH/DoT" >&2
+                fi
+            fi
+
+            local bootstrap_ip="${UPSTREAM_DNS:-1.1.1.1}"
+            upstream_block="${upstream_block}server ${bootstrap_ip} -bootstrap-dns -exclude-default-group"$'\n'
+
+            local srv
+            while IFS= read -r srv; do
+                [ -z "$srv" ] && continue
+                upstream_block="${upstream_block}server ${srv}${proxy_flag}"$'\n'
+            done < <(tr ',' ' ' <<< "$DNS_ENCRYPTED_SERVERS" | tr -s '[:space:]' '\n')
+        else
+            upstream_block="${upstream_block}server ${UPSTREAM_DNS}"$'\n'
+        fi
+
+        tmp_conf="$(mktemp)"
+        awk -v block="$upstream_block" '
+            BEGIN { in_block = 0; replaced = 0 }
+            /^# --- BEGIN UPSTREAMS/ {
+                print "# --- BEGIN UPSTREAMS (auto-managed when .env DNS vars are set) ---"
+                printf "%s", block
+                print "# --- END UPSTREAMS ---"
+                in_block = 1
+                replaced = 1
+                next
+            }
+            /^# --- END UPSTREAMS/ { in_block = 0; next }
+            !in_block { print }
+            END {
+                if (!replaced) {
+                    printf "\n# --- BEGIN UPSTREAMS (auto-managed when .env DNS vars are set) ---\n%s# --- END UPSTREAMS ---\n", block
+                }
+            }
+        ' "$SMARTDNS_CONF_FILE" > "$tmp_conf" && mv "$tmp_conf" "$SMARTDNS_CONF_FILE"
+    fi
 
     if [ -n "${PROXY_EXTRA_DOMAINS:-}" ]; then
+        local domain rule
         while IFS= read -r domain; do
             domain="${domain#.}"
-            if [ -z "$domain" ]; then
-                continue
-            fi
-            rule="ipset=/${domain}/special_proxy"
-            if ! grep -qxF "$rule" "$DNSMASQ_CONF_FILE" 2>/dev/null; then
-                printf '%s\n' "$rule" >> "$DNSMASQ_CONF_FILE"
+            [ -z "$domain" ] && continue
+            rule="ipset /${domain}/special_proxy"
+            if ! grep -qxF "$rule" "$SMARTDNS_CONF_FILE" 2>/dev/null; then
+                printf '%s\n' "$rule" >> "$SMARTDNS_CONF_FILE"
             fi
         done < <(tr ',' ' ' <<< "$PROXY_EXTRA_DOMAINS" | tr -s '[:space:]' '\n')
     fi
@@ -130,7 +208,8 @@ main() {
         cp -a /opt/nvm-seed/. "$NVM_DIR/"
     fi
 
-    chown -R dev:dev /workspace /home/dev/.vscode-server /home/dev/.nvm /home/dev/.nuget
+    mkdir -p /home/dev/.config /home/dev/.gemini /home/dev/.config/antigravity
+    chown -R dev:dev /workspace /home/dev/.vscode-server /home/dev/.gemini /home/dev/.config /home/dev/.nvm /home/dev/.nuget
 
     # Прокидываем симлинки активной Node в /usr/local/bin для расширений VS Code
     local node_bin_dir
@@ -159,25 +238,21 @@ EOF
     configure_ssh_keys
     configure_git
 
-    # --- Настройка селективного прокси ---
-    local proxy_active=0
-    case "${PROXY_ENABLED:-true}" in
-        true|TRUE|1|yes|YES) proxy_active=1 ;;
-    esac
-
-    if [ "$proxy_active" -eq 1 ] && [ -n "${SOCKS_PROXY_HOST:-}" ]; then
+    # --- Селективный прокси (redsocks + iptables) ---
+    if is_truthy "${PROXY_ENABLED:-true}" && configure_redsocks_file; then
         echo "Setting up selective proxy rules..."
-        configure_proxy_files
         setup_proxy_iptables
         echo "✓ Proxy rules configured successfully"
-
         pgrep -x redsocks >/dev/null || redsocks -c "$REDSOCKS_CONF_FILE"
-        pgrep -x dnsmasq >/dev/null || dnsmasq --conf-file="$DNSMASQ_CONF_FILE"
-        echo "nameserver 127.0.0.1" > /etc/resolv.conf
     else
-        echo "Selective proxy disabled or SOCKS_PROXY_HOST not set — using direct DNS (${UPSTREAM_DNS:-1.1.1.1})"
-        echo "nameserver ${UPSTREAM_DNS:-1.1.1.1}" > /etc/resolv.conf
+        echo "Selective proxy disabled or no SOCKS host configured — skipping redsocks/iptables"
     fi
+
+    # --- DNS (SmartDNS: читает smartdns.conf, либо применяет переменные из .env) ---
+    configure_smartdns_file
+    mkdir -p /var/log/smartdns
+    pgrep -x smartdns >/dev/null || smartdns -c "$SMARTDNS_CONF_FILE" -p "$SMARTDNS_PID_FILE"
+    echo "nameserver 127.0.0.1" > /etc/resolv.conf
 
     mkdir -p /run/sshd
     ssh-keygen -A

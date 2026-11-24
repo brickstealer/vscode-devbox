@@ -1,6 +1,6 @@
 # VS Code Devbox
 
-Docker-окружение на базе `Ubuntu 24.04` для удалённой разработки по SSH (VS Code Remote-SSH / Antigravity) с преднастроенным стеком разработки и опциональным селективным проксированием отдельных доменов через `redsocks`.
+Docker-окружение на базе `Ubuntu 24.04` для удалённой разработки по SSH (VS Code Remote-SSH / Antigravity) с преднастроенным стеком разработки, `SmartDNS` (с поддержкой DoH/DoT) и опциональным селективным проксированием отдельных доменов через `redsocks`.
 
 ## Что внутри
 
@@ -9,26 +9,32 @@ Docker-окружение на базе `Ubuntu 24.04` для удалённой
   - `.NET SDK 10.0` (`DOTNET_ROOT=/usr/share/dotnet`)
   - `nvm v0.40.3`, Node.js LTS и `pnpm` (шаблон в `/opt/nvm-seed`, разворачивается в volume `/home/dev/.nvm` при первом старте; симлинки прокидываются в `/usr/local/bin`)
   - `git`, `curl`, `wget`, `unzip`, `procps` и базовые утилиты
-- **Селективный прокси (`PROXY_ENABLED=true` и задан `SOCKS_PROXY_HOST`):** `dnsmasq` + `ipset` + `redsocks` + `iptables`.
-  - `dnsmasq` (`127.0.0.1`) использует `UPSTREAM_DNS`, фильтрует `AAAA`-записи и добавляет IP для доменов из `dnsmasq.conf` (и `PROXY_EXTRA_DOMAINS`) в `ipset` `special_proxy` (`timeout 300`).
+- **DNS (`SmartDNS`):**
+  - Слушает `127.0.0.1:53`, отключает IPv6 через `force-AAAA-SOA yes`, кэширует ответы и работает с `speed-check-mode none` (чтобы не конфликтовать с проксированием).
+  - Поддерживает обычный DNS (`server`), **DoH** (`https://...`), **DoT** (`tls://...`) и при необходимости маршрутизацию DoH/DoT через SOCKS5 (`DNS_ENCRYPTED_VIA_SOCKS=true`).
+  - Если `UPSTREAM_DNS` и `DNS_ENCRYPTED_SERVERS` в `.env` не заданы, `SmartDNS` просто читает конфигурацию напрямую из `smartdns.conf`.
+- **Селективный прокси (`redsocks` + `iptables` + `ipset`):**
+  - `SmartDNS` добавляет IP для доменов из `smartdns.conf` (и `PROXY_EXTRA_DOMAINS`) в `ipset` `special_proxy`.
   - `iptables` заворачивает TCP-трафик для IP из `special_proxy` в `redsocks` (`127.0.0.1:12345`) в обход локальных подсетей и блокирует QUIC (`UDP/443`).
-  - `redsocks` перенаправляет этот трафик на прокси `SOCKS_PROXY_HOST:SOCKS_PROXY_PORT` (`SOCKS_PROXY_TYPE`).
-  - Если `PROXY_ENABLED=false` или `SOCKS_PROXY_HOST` не задан, настройка прокси пропускается и используется прямое подключение.
+  - `redsocks` перенаправляет этот трафик на прокси из `SOCKS_PROXY_HOST` (или напрямую из `redsocks.conf`, если `SOCKS_PROXY_HOST` в `.env` не задан и в конфиге указан не `127.0.0.1`).
 
 ## Структура
 
-- `Dockerfile` — сборка образа `vscode-devbox`.
+- `Dockerfile` — сборка образа `vscode-devbox` (включая установку `SmartDNS` с проверкой SHA-256).
 - `docker-compose.yml` — запуск контейнера, проброс SSH-порта, `cap_add: [NET_ADMIN]`, `environment` и volume.
-- `.env.example` — шаблон локальных настроек окружения, сети, SSH и Git.
-- `entrypoint.sh` — инициализация `nvm`, симлинков Node.js, SSH-ключа, `/home/dev/.gitconfig`, конфигов `dnsmasq`/`redsocks`, правил `ipset`/`iptables` и запуск `sshd`.
-- `dnsmasq.conf` — базовый конфиг `dnsmasq` и список проксируемых доменов.
+- `.env.example` — шаблон локальных настроек окружения, сети, DoH/DoT, SSH и Git.
+- `entrypoint.sh` — инициализация `nvm`, симлинков Node.js, SSH-ключа, `/home/dev/.gitconfig`, применение параметров `.env` (если заданы), настройка `iptables`/`redsocks` и запуск `smartdns` + `sshd`.
+- `smartdns.conf` — конфиг `SmartDNS`, правила `ipset` и секция апстримов по умолчанию.
 - `redsocks.conf` — базовый конфиг `redsocks`.
 - `authorized_keys` — шаблон файла публичных SSH-ключей (ключи также можно передавать через `SSH_PUBLIC_KEY` в `.env`).
 
 ## Переменные `.env`
 
+Если параметры DNS или прокси оставить пустыми, контейнер использует настройки напрямую из `smartdns.conf` и `redsocks.conf`.
+
 | Переменная | По умолчанию | Описание |
 | :--- | :--- | :--- |
+| `DEVBOX_IMAGE` | `vscode-devbox` | Docker-образ (по умолчанию локальный; можно указать образ из GHCR) |
 | `CONTAINER_NAME` | `vscode-devbox` | Имя контейнера Docker |
 | `WORKSPACE_PATH` | `./workspace` | Путь к каталогу проектов на хосте, монтируемому в `/workspace` |
 | `TZ` | `UTC` | Часовой пояс внутри контейнера |
@@ -37,16 +43,18 @@ Docker-окружение на базе `Ubuntu 24.04` для удалённой
 | `SSH_PUBLIC_KEY` | *(пусто)* | Публичный SSH-ключ, автоматически добавляемый в `/home/dev/.ssh/authorized_keys` |
 | `GIT_USER_NAME` | *(пусто)* | `user.name` для `/home/dev/.gitconfig` |
 | `GIT_USER_EMAIL` | *(пусто)* | `user.email` для `/home/dev/.gitconfig` |
-| `UPSTREAM_DNS` | `1.1.1.1` | DNS-сервер контейнера и upstream для `dnsmasq` |
+| `UPSTREAM_DNS` | *(пусто; в compose `1.1.1.1`)* | Обычный DNS-сервер (IP); при использовании `DNS_ENCRYPTED_SERVERS` служит `-bootstrap-dns` |
+| `DNS_ENCRYPTED_SERVERS` | *(пусто)* | DoH/DoT серверы через запятую (`https://...`, `tls://...`) |
+| `DNS_ENCRYPTED_VIA_SOCKS` | `false` | Проксировать DoH/DoT-запросы `SmartDNS` через SOCKS5 (`true` / `false`) |
+| `PROXY_EXTRA_DOMAINS` | *(пусто)* | Дополнительные домены для `special_proxy` через запятую |
 | `PROXY_ENABLED` | `true` | Включение селективного проксирования (`true` / `false`) |
 | `SOCKS_PROXY_HOST` | *(пусто)* | IP или хостнейм прокси-сервера для `redsocks` |
 | `SOCKS_PROXY_PORT` | `10808` | Порт прокси-сервера для `redsocks` |
 | `SOCKS_PROXY_TYPE` | `socks5` | Тип прокси в `redsocks` (`socks5`, `socks4`, `http-connect`) |
-| `PROXY_EXTRA_DOMAINS` | *(пусто)* | Дополнительные домены для `special_proxy` через запятую |
 
 ## Быстрый старт
 
-1. Создайте `.env` из шаблона и укажите свои настройки (как минимум `SSH_PUBLIC_KEY` либо ключ в `authorized_keys`, `GIT_USER_NAME`, `GIT_USER_EMAIL`, а при использовании прокси — `UPSTREAM_DNS` и `SOCKS_PROXY_HOST`):
+1. Создайте `.env` из шаблона и укажите свои настройки (включая `SSH_PUBLIC_KEY` либо ключ в `authorized_keys`; если контейнер запускается на удалённом сервере, а не локально — задайте `SSH_BIND_IP=0.0.0.0`):
    ```bash
    cp .env.example .env
    ```
@@ -54,14 +62,108 @@ Docker-окружение на базе `Ubuntu 24.04` для удалённой
    ```bash
    docker compose up -d --build
    ```
-3. Подключитесь по SSH:
+3. Подключитесь по SSH или через VS Code (подробная инструкция ниже):
    ```bash
    ssh -p 2222 dev@127.0.0.1
    ```
+
+## Подключение из VS Code (Windows и Linux)
+
+### 1. Генерация SSH-ключа
+
+Если у вас уже есть ключ (например, `~/.ssh/id_ed25519`), можно использовать его публичную часть (`.pub`). Чтобы создать отдельный ключ под devbox:
+
+**Linux (терминал):**
+```bash
+ssh-keygen -t ed25519 -C "dev@vscode-devbox" -f ~/.ssh/id_ed25519_devbox
+cat ~/.ssh/id_ed25519_devbox.pub
+```
+
+**Windows (PowerShell):**
+```powershell
+mkdir -Force "$env:USERPROFILE\.ssh"
+ssh-keygen -t ed25519 -C "dev@vscode-devbox" -f "$env:USERPROFILE\.ssh\id_ed25519_devbox"
+Get-Content "$env:USERPROFILE\.ssh\id_ed25519_devbox.pub"
+```
+
+Скопируйте выведенную строку `ssh-ed25519 AAAA...` в переменную `SSH_PUBLIC_KEY="..."` внутри `.env` на хосте с Docker (либо в файл `authorized_keys` до сборки) и запустите/пересоздайте контейнер (`docker compose up -d`).
+
+> Если ключ создан с парольной фразой (passphrase), добавьте его в `ssh-agent`, чтобы VS Code не запрашивал её при каждом переподключении:
+> - **Linux:** `eval "$(ssh-agent -s)" && ssh-add ~/.ssh/id_ed25519_devbox`
+> - **Windows (PowerShell от администратора — один раз для включения службы):**
+>   `Set-Service ssh-agent -StartupType Automatic; Start-Service ssh-agent`
+>   затем в обычном PowerShell: `ssh-add "$env:USERPROFILE\.ssh\id_ed25519_devbox"`
+
+### 2. Настройка SSH-конфига (`~/.ssh/config`)
+
+Если контейнер работает на этой же машине (Linux или Docker Desktop / WSL2 на Windows), используйте `HostName 127.0.0.1`. Если контейнер запущен на другом сервере в сети — укажите IP сервера (и проверьте, что в `.env` контейнера задан `SSH_BIND_IP=0.0.0.0`).
+
+**Linux (`~/.ssh/config`):**
+```ssh-config
+Host vscode-devbox
+    HostName 127.0.0.1
+    Port 2222
+    User dev
+    IdentityFile ~/.ssh/id_ed25519_devbox
+    IdentitiesOnly yes
+    ForwardAgent yes
+```
+Проверьте права на файл конфигурации:
+```bash
+chmod 700 ~/.ssh && chmod 600 ~/.ssh/config
+```
+
+**Windows (`C:\Users\<ИмяПользователя>\.ssh\config`):**
+
+Откройте файл в редакторе (например, в PowerShell: `notepad "$env:USERPROFILE\.ssh\config"`) и добавьте:
+```ssh-config
+Host vscode-devbox
+    HostName 127.0.0.1
+    Port 2222
+    User dev
+    IdentityFile ~/.ssh/id_ed25519_devbox
+    IdentitiesOnly yes
+    ForwardAgent yes
+```
+*(В Windows OpenSSH пути вида `~/.ssh/...` или `C:/Users/<Имя>/.ssh/...` с прямыми слэшами работают штатно.)*
+
+Проверьте подключение из терминала / PowerShell:
+```bash
+ssh vscode-devbox
+```
+
+> **После пересоздания контейнера (`docker compose down && docker compose up -d`):** SSH host-ключи внутри контейнера генерируются заново, поэтому SSH предупредит об изменении ключа (`REMOTE HOST IDENTIFICATION HAS CHANGED`). Сбросьте старый отпечаток командой:
+> ```bash
+> ssh-keygen -R "[127.0.0.1]:2222"
+> ```
+> Либо для **локального** стенда (`127.0.0.1`) можно добавить в блок `Host vscode-devbox` строки `StrictHostKeyChecking no` и `UserKnownHostsFile /dev/null` (на Linux) или `UserKnownHostsFile NUL` (на Windows).
+
+### 3. Подключение в VS Code / Antigravity
+
+1. Установите в VS Code расширение **Remote - SSH** (`ms-vscode-remote.remote-ssh`). В **Antigravity** поддержка Remote-SSH доступна сразу.
+2. Нажмите `F1` (или `Ctrl+Shift+P`) и выберите **Remote-SSH: Connect to Host...** -> **`vscode-devbox`**.
+3. Если VS Code (особенно на Windows) спросит тип ОС удалённого хоста — выберите **Linux**. Чтобы отключить повторный запрос, можно добавить в локальный `settings.json` клиента:
+   ```json
+   "remote.SSH.remotePlatform": {
+     "vscode-devbox": "linux"
+   }
+   ```
+4. После подключения откройте рабочую директорию: **File -> Open Folder...** -> `/workspace`.
+5. *(Для Antigravity внутри контейнера)*: так как стандартные профили Docker блокируют вложенные kernel namespaces песочницы терминала, в настройках прав Antigravity (`Settings -> General -> Global Permissions -> Permission Preset`) выберите **Turbo** или **Request Review**.
 
 ## Тома (volumes)
 
 - `/workspace` — рабочий каталог с проектами (`WORKSPACE_PATH`).
 - `./volumes/vscode-server` -> `/home/dev/.vscode-server` — кэш и расширения редактора.
+- `./volumes/gemini` -> `/home/dev/.gemini` — настройки, сессии и токен Antigravity.
+- `./volumes/antigravity-config` -> `/home/dev/.config/antigravity` — конфигурация учётных данных Antigravity.
 - `./volumes/nvm` -> `/home/dev/.nvm` — версии Node.js и глобальные пакеты.
 - `./volumes/nuget` -> `/home/dev/.nuget` — кэш пакетов NuGet.
+
+## CI/CD и релизы (GitHub Actions)
+
+- **[ci.yml](.github/workflows/ci.yml)** — запускается на `push` и `pull_request` в `main`: проверяет `entrypoint.sh` (`bash -n`, `shellcheck`), окончания строк `LF`, валидность `docker-compose.yml` и тестовую сборку `Dockerfile`.
+- **[release.yml](.github/workflows/release.yml)** — запускается по пушу тега `v*` (например, `git tag v1.0.0 && git push origin v1.0.0`):
+  - собирает и публикует образ в GitHub Container Registry (`ghcr.io/<owner>/<repo>`);
+  - создаёт GitHub Release с архивом конфигураций `vscode-devbox-<tag>.tar.gz`, файлом контрольной суммы `.sha256` и сгенерированным changelog.
+  - если тег содержит суффикс (например, `v1.0.0-rc.1`), релиз автоматически помечается как pre-release без обновления тега `latest`.

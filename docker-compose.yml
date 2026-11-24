@@ -1,14 +1,16 @@
 services:
   devbox:
     build: .
-    image: vscode-devbox
+    image: ${DEVBOX_IMAGE:-vscode-devbox}
     container_name: ${CONTAINER_NAME:-vscode-devbox}
     environment:
       - TZ=${TZ:-UTC}
       - "GIT_USER_NAME=${GIT_USER_NAME:-}"
       - "GIT_USER_EMAIL=${GIT_USER_EMAIL:-}"
       - "SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY:-}"
-      - UPSTREAM_DNS=${UPSTREAM_DNS:-1.1.1.1}
+      - UPSTREAM_DNS=${UPSTREAM_DNS:-}
+      - "DNS_ENCRYPTED_SERVERS=${DNS_ENCRYPTED_SERVERS:-}"
+      - DNS_ENCRYPTED_VIA_SOCKS=${DNS_ENCRYPTED_VIA_SOCKS:-false}
       - PROXY_ENABLED=${PROXY_ENABLED:-true}
       - SOCKS_PROXY_HOST=${SOCKS_PROXY_HOST:-}
       - SOCKS_PROXY_PORT=${SOCKS_PROXY_PORT:-10808}
@@ -25,6 +27,8 @@ services:
     volumes:
       - ${WORKSPACE_PATH:-./workspace}:/workspace
       - ./volumes/vscode-server:/home/dev/.vscode-server
+      - ./volumes/gemini:/home/dev/.gemini
+      - ./volumes/antigravity-config:/home/dev/.config/antigravity
       - ./volumes/nvm:/home/dev/.nvm
       - ./volumes/nuget:/home/dev/.nuget
     restart: unless-stopped

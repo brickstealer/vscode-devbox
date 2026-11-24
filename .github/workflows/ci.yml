@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint scripts & configs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check bash syntax & ShellCheck
+        run: |
+          bash -n entrypoint.sh
+          shellcheck --severity=warning entrypoint.sh
+
+      - name: Check LF line endings
+        run: |
+          if grep -rn $'\r' Dockerfile docker-compose.yml entrypoint.sh smartdns.conf redsocks.conf authorized_keys .env.example README.md .github/workflows/*.yml; then
+            echo "CRLF line endings detected" >&2
+            exit 1
+          fi
+
+      - name: Validate docker-compose.yml
+        run: |
+          cp .env.example .env
+          docker compose config -q
+          rm -f .env
+
+  build:
+    name: Test Docker build
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: vscode-devbox:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

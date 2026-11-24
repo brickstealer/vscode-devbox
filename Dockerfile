@@ -37,7 +37,7 @@ RUN if id -u 1000 >/dev/null 2>&1; then \
         useradd -m -u 1000 -s /bin/bash dev; \
     fi \
     && echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/dev \
-    && mkdir -p /home/dev/.ssh /home/dev/.vscode-server /home/dev/.nvm /home/dev/.nuget /workspace \
+    && mkdir -p /home/dev/.ssh /home/dev/.vscode-server /home/dev/.gemini /home/dev/.config/antigravity /home/dev/.nvm /home/dev/.nuget /workspace \
     && chown -R dev:dev /home/dev /workspace \
     && chmod 700 /home/dev/.ssh
 
@@ -62,23 +62,34 @@ export NVM_DIR="$HOME/.nvm"
 EOF
 
 # Сетевой стек отдельным слоем, чтобы не инвалидировать кэш .NET и nvm
+ARG SMARTDNS_RELEASE=Release48.5
+ARG SMARTDNS_VERSION=1.2026.11.20-0147
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    dnsmasq \
     ipset \
     redsocks \
     iptables \
     iproute2 \
     dnsutils \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ARCH="$(dpkg --print-architecture)" \
+    && case "$ARCH" in \
+        amd64) SMARTDNS_ARCH="x86_64"; SMARTDNS_SHA256="a47c6c3c4c03b4ee2c82343c655a8441126229129887c5efea69465730f679b8" ;; \
+        arm64) SMARTDNS_ARCH="aarch64"; SMARTDNS_SHA256="a3ce82eaa82a96fc4c474a20ba38d4e38b0d56b86ab991260b4f38aca8a5dd8c" ;; \
+        *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/pymumu/smartdns/releases/download/${SMARTDNS_RELEASE}/smartdns.${SMARTDNS_VERSION}.${SMARTDNS_ARCH}-debian-all.deb" -o /tmp/smartdns.deb \
+    && echo "${SMARTDNS_SHA256}  /tmp/smartdns.deb" | sha256sum -c - \
+    && dpkg -i /tmp/smartdns.deb \
+    && rm -f /tmp/smartdns.deb
 
 COPY authorized_keys /home/dev/.ssh/authorized_keys
-COPY dnsmasq.conf /etc/dnsmasq.conf
+COPY smartdns.conf /etc/smartdns/smartdns.conf
 COPY redsocks.conf /etc/redsocks.conf
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 RUN sed -i 's/\r$//' \
         /usr/local/bin/entrypoint.sh \
-        /etc/dnsmasq.conf \
+        /etc/smartdns/smartdns.conf \
         /etc/redsocks.conf \
     && chown dev:dev /home/dev/.ssh/authorized_keys /home/dev/.bashrc \
     && chmod 600 /home/dev/.ssh/authorized_keys \
