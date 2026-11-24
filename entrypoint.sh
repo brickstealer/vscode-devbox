@@ -16,13 +16,23 @@ is_truthy() {
     esac
 }
 
-get_dns_cache_ttl() {
-    local ttl="${DNS_CACHE_TTL:-300}"
+validate_ttl() {
+    local var_name="$1"
+    local ttl="$2"
+    local extra_hint="${3:-}"
     if [[ ! "$ttl" =~ ^[1-9][0-9]*$ ]] || [ "$ttl" -gt 2147483 ]; then
-        echo "Error: DNS_CACHE_TTL must be an integer between 1 and 2147483 seconds (got '${ttl}'). To disable DNS cache, set DNS_CACHE_ENABLED=false." >&2
+        echo "Error: ${var_name} must be an integer between 1 and 2147483 seconds (got '${ttl}').${extra_hint}" >&2
         return 1
     fi
     printf '%s\n' "$ttl"
+}
+
+get_dns_cache_ttl() {
+    validate_ttl "DNS_CACHE_TTL" "${DNS_CACHE_TTL:-300}" " To disable DNS cache, set DNS_CACHE_ENABLED=false."
+}
+
+get_ipset_ttl() {
+    validate_ttl "IPSET_TTL" "${IPSET_TTL:-3600}"
 }
 
 configure_ssh_keys() {
@@ -84,6 +94,16 @@ read_redsocks_value() {
     sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\([^;[:space:]]*\).*/\1/p" "$REDSOCKS_CONF_FILE" | head -n 1
 }
 
+get_configured_socks_ip() {
+    local conf_ip
+    conf_ip="$(read_redsocks_value ip)"
+    if [ -n "$conf_ip" ] && [ "$conf_ip" != "127.0.0.1" ] && [ "$conf_ip" != "0.0.0.0" ]; then
+        printf '%s\n' "$conf_ip"
+        return 0
+    fi
+    return 1
+}
+
 # Возвращает 0, если прокси для redsocks реально сконфигурирован (через .env или вручную в redsocks.conf)
 configure_redsocks_file() {
     if [ -n "${SOCKS_PROXY_HOST:-}" ]; then
@@ -101,12 +121,7 @@ configure_redsocks_file() {
     fi
 
     # Если в .env SOCKS_PROXY_HOST пустой — читаем redsocks.conf как есть (кроме плейсхолдера 127.0.0.1)
-    local conf_ip
-    conf_ip="$(read_redsocks_value ip)"
-    if [ -n "$conf_ip" ] && [ "$conf_ip" != "127.0.0.1" ] && [ "$conf_ip" != "0.0.0.0" ]; then
-        return 0
-    fi
-    return 1
+    get_configured_socks_ip >/dev/null
 }
 
 configure_smartdns_file() {
@@ -125,7 +140,7 @@ configure_smartdns_file() {
         cache_block="${cache_block}serve-expired no"$'\n'
         cache_block="${cache_block}rr-ttl ${cache_ttl}"$'\n'
         cache_block="${cache_block}rr-ttl-reply-max ${cache_ttl}"$'\n'
-        cache_block="${cache_block}ipset-timeout yes"$'\n'
+        cache_block="${cache_block}ipset-timeout no"$'\n'
     else
         cache_block="cache-size 0"$'\n'
         cache_block="${cache_block}cache-persist no"$'\n'
@@ -171,10 +186,10 @@ configure_smartdns_file() {
 
         if [ -n "${DNS_ENCRYPTED_SERVERS:-}" ]; then
             if is_truthy "${DNS_ENCRYPTED_VIA_SOCKS:-false}"; then
-                socks_ip="$(read_redsocks_value ip)"
+                socks_ip="$(get_configured_socks_ip || true)"
                 socks_port="$(read_redsocks_value port)"
                 socks_type="$(read_redsocks_value type)"
-                if [ -n "$socks_ip" ] && [ "$socks_ip" != "127.0.0.1" ] && [ "$socks_ip" != "0.0.0.0" ] && [ "$socks_type" = "socks5" ]; then
+                if [ -n "$socks_ip" ] && [ "$socks_type" = "socks5" ]; then
                     upstream_block="${upstream_block}proxy-server socks5://${socks_ip}:${socks_port:-10808} -name env_socks"$'\n'
                     proxy_flag=" -proxy env_socks"
                 else
@@ -249,6 +264,7 @@ disable_ipv6() {
 }
 
 cleanup_proxy_iptables() {
+    iptables -t nat -D OUTPUT -p tcp -m owner ! --gid-owner "$SMARTDNS_GROUP" -j SPECIAL_PROXY 2>/dev/null || true
     iptables -t nat -D OUTPUT -p tcp -j SPECIAL_PROXY 2>/dev/null || true
     iptables -t nat -D PREROUTING -p tcp -j SPECIAL_PROXY 2>/dev/null || true
     iptables -t nat -F SPECIAL_PROXY 2>/dev/null || true
@@ -265,38 +281,45 @@ cleanup_proxy_iptables() {
 }
 
 setup_proxy_iptables() {
-    local cache_ttl="${1:-}"
-    if [ -z "$cache_ttl" ]; then
-        cache_ttl="$(get_dns_cache_ttl)"
+    local ipset_ttl="${1:-}"
+    local socks_ip
+    if [ -z "$ipset_ttl" ]; then
+        ipset_ttl="$(get_ipset_ttl)"
     fi
+    socks_ip="$(get_configured_socks_ip || true)"
 
     cleanup_proxy_iptables
 
-    # Create or atomically update ipset so timeout always matches DNS_CACHE_TTL
+    # Create or atomically update ipset so timeout always matches IPSET_TTL
     if ipset list -t special_proxy >/dev/null 2>&1; then
         ipset destroy special_proxy_tmp 2>/dev/null || true
-        ipset create special_proxy_tmp hash:ip timeout "$cache_ttl"
+        ipset create special_proxy_tmp hash:ip timeout "$ipset_ttl"
         ipset swap special_proxy_tmp special_proxy
         ipset destroy special_proxy_tmp
     else
-        ipset create special_proxy hash:ip timeout "$cache_ttl"
+        ipset create special_proxy hash:ip timeout "$ipset_ttl"
     fi
 
     iptables -t nat -N SPECIAL_PROXY
     iptables -N SPECIAL_PROXY_UDP
 
-    # Exclude local networks
+    # Exclude local networks and the upstream SOCKS server itself (prevents redsocks redirect loops)
     local cidr
     for cidr in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
         iptables -t nat -A SPECIAL_PROXY -d "$cidr" -j RETURN
         iptables -A SPECIAL_PROXY_UDP -d "$cidr" -j RETURN
     done
+    if [ -n "$socks_ip" ]; then
+        iptables -t nat -A SPECIAL_PROXY -d "${socks_ip}/32" -j RETURN
+        iptables -A SPECIAL_PROXY_UDP -d "${socks_ip}/32" -j RETURN
+    fi
 
     # Redirect matched TCP traffic to redsocks and reject all UDP (including QUIC/WebRTC) to force TCP fallback
     iptables -t nat -A SPECIAL_PROXY -p tcp -m set --match-set special_proxy dst -j REDIRECT --to-ports 12345
     iptables -A SPECIAL_PROXY_UDP -p udp -m set --match-set special_proxy dst -j REJECT
 
-    iptables -t nat -I OUTPUT -p tcp -j SPECIAL_PROXY
+    # Skip SmartDNS traffic on OUTPUT (also when DNS_FORCE_REDIRECT=false); -m owner cannot be used inside PREROUTING chains
+    iptables -t nat -I OUTPUT -p tcp -m owner ! --gid-owner "$SMARTDNS_GROUP" -j SPECIAL_PROXY
     iptables -t nat -I PREROUTING -p tcp -j SPECIAL_PROXY
     iptables -I OUTPUT -p udp -m owner ! --gid-owner "$SMARTDNS_GROUP" -j SPECIAL_PROXY_UDP
     iptables -I FORWARD -p udp -j SPECIAL_PROXY_UDP
@@ -318,7 +341,7 @@ cleanup_dns_iptables() {
 
 setup_dns_iptables() {
     local socks_ip
-    socks_ip="$(read_redsocks_value ip)"
+    socks_ip="$(get_configured_socks_ip || true)"
 
     cleanup_dns_iptables
 
@@ -371,7 +394,7 @@ EOF
     # Block external DoT/DoQ (853) and public DoH (443) for all processes except SmartDNS
     iptables -N DNS_GUARD
     iptables -A DNS_GUARD -m owner --gid-owner "$SMARTDNS_GROUP" -j RETURN
-    if [ -n "$socks_ip" ] && [ "$socks_ip" != "127.0.0.1" ] && [ "$socks_ip" != "0.0.0.0" ]; then
+    if [ -n "$socks_ip" ]; then
         iptables -A DNS_GUARD -d "${socks_ip}/32" -j RETURN
     fi
     iptables -A DNS_GUARD -p tcp --dport 853 -j REJECT
@@ -417,8 +440,13 @@ EOF
     configure_ssh_keys
     configure_git
 
-    local dns_cache_ttl
+    local dns_cache_ttl ipset_ttl
     dns_cache_ttl="$(get_dns_cache_ttl)"
+    ipset_ttl="$(get_ipset_ttl)"
+
+    if is_truthy "${DNS_CACHE_ENABLED:-true}" && [ "$ipset_ttl" -le "$dns_cache_ttl" ]; then
+        echo "Warning: IPSET_TTL (${ipset_ttl}s) <= DNS_CACHE_TTL (${dns_cache_ttl}s); ipset entries may expire before SmartDNS cache or client DNS TTL." >&2
+    fi
 
     disable_ipv6
     ensure_smartdns_group
@@ -432,8 +460,8 @@ EOF
             echo "Error: PROXY_ENABLED=true, but no SOCKS proxy is configured. Set SOCKS_PROXY_HOST in .env (or ip in redsocks.conf), or set PROXY_ENABLED=false." >&2
             return 1
         fi
-        echo "Setting up selective proxy rules (TTL: ${dns_cache_ttl}s)..."
-        setup_proxy_iptables "$dns_cache_ttl"
+        echo "Setting up selective proxy rules (ipset TTL: ${ipset_ttl}s, DNS TTL: ${dns_cache_ttl}s)..."
+        setup_proxy_iptables "$ipset_ttl"
         echo "✓ Proxy rules configured successfully"
         pgrep -x redsocks >/dev/null || redsocks -c "$REDSOCKS_CONF_FILE"
         if ! pgrep -x redsocks >/dev/null; then

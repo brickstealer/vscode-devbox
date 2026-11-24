@@ -11,7 +11,7 @@ Docker-окружение на базе `Ubuntu 24.04` для удалённой
   - `git`, `curl`, `wget`, `unzip`, `procps` и базовые утилиты
 - **DNS (`SmartDNS`):**
   - Слушает `127.0.0.1:53` (UDP/TCP), отключает IPv6 (`force-AAAA-SOA yes`) и записи `SVCB`/`HTTPS` (`force-qtype-SOA 64 65`), работает с `speed-check-mode none` (чтобы не конфликтовать с проксированием).
-  - Синхронизирует время жизни DNS-кэша и записей `ipset` через `DNS_CACHE_TTL` (по умолчанию `300` сек) и позволяет полностью отключить DNS-кэш через `DNS_CACHE_ENABLED=false`.
+  - Раздельно управляет временем жизни DNS-кэша и ответов клиентам (`DNS_CACHE_TTL`, по умолчанию `300` сек; отключается через `DNS_CACHE_ENABLED=false`) и сроком жизни IP в `ipset special_proxy` (`IPSET_TTL`, по умолчанию `3600` сек = 1 час), чтобы исключить гонки на границе TTL и протухание `ipset` при долгом кэше в приложениях.
   - При `DNS_FORCE_REDIRECT=true` (по умолчанию) запускается с отдельной группой `smartdns`: `iptables` заворачивает любые сторонние запросы `UDP/TCP 53` в локальный `SmartDNS` и блокирует обход через внешний `DoT/DoQ (853)` и известные публичные `DoH (443)`, оставляя самому `SmartDNS` полный доступ к апстримам и DoH/DoT.
   - Поддерживает обычный DNS (`server`), **DoH** (`https://...`), **DoT** (`tls://...`) и при необходимости маршрутизацию DoH/DoT через SOCKS5 (`DNS_ENCRYPTED_VIA_SOCKS=true`).
   - Если `UPSTREAM_DNS` и `DNS_ENCRYPTED_SERVERS` в `.env` не заданы, `SmartDNS` просто читает конфигурацию апстримов напрямую из `smartdns.conf`.
@@ -50,7 +50,8 @@ Docker-окружение на базе `Ubuntu 24.04` для удалённой
 | `DNS_ENCRYPTED_SERVERS` | *(пусто)* | DoH/DoT серверы через запятую (`https://...`, `tls://...`) |
 | `DNS_ENCRYPTED_VIA_SOCKS` | `false` | Проксировать DoH/DoT-запросы `SmartDNS` через SOCKS5 (`true` / `false`) |
 | `DNS_CACHE_ENABLED` | `true` | Включить локальный DNS-кэш `SmartDNS` (`true` / `false`; при `false` каждый запрос идёт на апстрим) |
-| `DNS_CACHE_TTL` | `300` | Единое время жизни (в секундах) для DNS-кэша `SmartDNS` и записей `ipset special_proxy` |
+| `DNS_CACHE_TTL` | `300` | Время жизни (в секундах) записей DNS-кэша `SmartDNS` и TTL в ответах клиентам |
+| `IPSET_TTL` | `3600` | Время жизни (в секундах) IP-адресов в `ipset special_proxy` (независимо от `DNS_CACHE_TTL`) |
 | `DNS_FORCE_REDIRECT` | `true` | Принудительный заворот `UDP/TCP 53` в `SmartDNS` и блокировка обхода через внешний `DoT (853)` / публичные `DoH` |
 | `PROXY_EXTRA_DOMAINS` | *(пусто)* | Дополнительные домены для `special_proxy` через запятую |
 | `PROXY_ENABLED` | `true` | Включение селективного проксирования (`true` / `false`; при `true` требует валидный прокси — *fail-closed*) |
