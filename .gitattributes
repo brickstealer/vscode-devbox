@@ -1,0 +1,10 @@
+# Принудительный LF, чтобы скрипты и конфиги не ломались в Linux-контейнере
+* text=auto eol=lf
+
+Dockerfile text eol=lf
+authorized_keys text eol=lf
+*.sh text eol=lf
+*.conf text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf

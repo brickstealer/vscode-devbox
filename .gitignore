@@ -1,0 +1,26 @@
+# Локальные данные контейнера (Docker volumes)
+volumes/
+workspace/
+
+# Переменные окружения и локальные переопределения Compose
+.env
+.env.*
+!.env.example
+docker-compose.override.yml
+
+# Приватные ключи и сертификаты
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+id_ecdsa*
+
+# Логи, временные файлы, IDE и ОС
+*.log
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

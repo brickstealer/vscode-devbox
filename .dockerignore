@@ -1,0 +1,16 @@
+.git
+.gitignore
+.gitattributes
+.dockerignore
+README.md
+LICENSE
+
+volumes/
+workspace/
+.env*
+docker-compose*.yml
+
+*.log
+.DS_Store
+.vscode/
+.idea/

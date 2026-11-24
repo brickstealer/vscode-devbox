@@ -1,0 +1,4 @@
+# Вставьте сюда свой публичный SSH-ключ (например, из ~/.ssh/id_ed25519.pub).
+# Файл копируется в /home/dev/.ssh/authorized_keys при сборке Docker-образа.
+# Пример:
+# ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExamplePublicKeyReplaceWithYourRealKey user@example

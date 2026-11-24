@@ -1,0 +1,30 @@
+services:
+  devbox:
+    build: .
+    image: vscode-devbox
+    container_name: ${CONTAINER_NAME:-vscode-devbox}
+    environment:
+      - TZ=${TZ:-UTC}
+      - "GIT_USER_NAME=${GIT_USER_NAME:-}"
+      - "GIT_USER_EMAIL=${GIT_USER_EMAIL:-}"
+      - "SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY:-}"
+      - UPSTREAM_DNS=${UPSTREAM_DNS:-1.1.1.1}
+      - PROXY_ENABLED=${PROXY_ENABLED:-true}
+      - SOCKS_PROXY_HOST=${SOCKS_PROXY_HOST:-}
+      - SOCKS_PROXY_PORT=${SOCKS_PROXY_PORT:-10808}
+      - SOCKS_PROXY_TYPE=${SOCKS_PROXY_TYPE:-socks5}
+      - "PROXY_EXTRA_DOMAINS=${PROXY_EXTRA_DOMAINS:-}"
+    cap_add:
+      - NET_ADMIN
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    dns:
+      - ${UPSTREAM_DNS:-1.1.1.1}
+    ports:
+      - "${SSH_BIND_IP:-127.0.0.1}:${SSH_PORT:-2222}:22"
+    volumes:
+      - ${WORKSPACE_PATH:-./workspace}:/workspace
+      - ./volumes/vscode-server:/home/dev/.vscode-server
+      - ./volumes/nvm:/home/dev/.nvm
+      - ./volumes/nuget:/home/dev/.nuget
+    restart: unless-stopped
