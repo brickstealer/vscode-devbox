@@ -142,6 +142,30 @@ configure_redsocks_file() {
     get_configured_socks_ip >/dev/null
 }
 
+replace_smartdns_upstreams_block() {
+    local block="$1"
+    local tmp_conf
+    tmp_conf="$(mktemp)"
+    awk -v block="$block" '
+        BEGIN { in_block = 0; replaced = 0 }
+        /^# --- BEGIN UPSTREAMS/ {
+            print "# --- BEGIN UPSTREAMS (auto-managed when .env DNS vars are set) ---"
+            printf "%s", block
+            print "# --- END UPSTREAMS ---"
+            in_block = 1
+            replaced = 1
+            next
+        }
+        /^# --- END UPSTREAMS/ { in_block = 0; next }
+        !in_block { print }
+        END {
+            if (!replaced) {
+                printf "\n# --- BEGIN UPSTREAMS (auto-managed when .env DNS vars are set) ---\n%s# --- END UPSTREAMS ---\n", block
+            }
+        }
+    ' "$SMARTDNS_CONF_FILE" > "$tmp_conf" && mv "$tmp_conf" "$SMARTDNS_CONF_FILE"
+}
+
 configure_smartdns_file() {
     local cache_ttl="${1:-}"
     local cache_block=""
@@ -222,27 +246,41 @@ configure_smartdns_file() {
         printf '\nforce-qtype-SOA 64 65\n' >> "$SMARTDNS_CONF_FILE"
     fi
 
-    # Обновляем блок апстримов только если заданы переменные в .env;
+    local proxy_all_dns=false
+    if is_truthy "${PROXY_ENABLED:-true}" && is_truthy "${PROXY_ALL:-false}"; then
+        proxy_all_dns=true
+    fi
+
+    # Обновляем блок апстримов, если заданы DNS-переменные в .env или включён PROXY_ALL=true;
     # иначе SmartDNS читает настройки серверов напрямую из smartdns.conf
-    if [ -n "${UPSTREAM_DNS:-}" ] || [ -n "${DNS_ENCRYPTED_SERVERS:-}" ]; then
+    if [ -n "${UPSTREAM_DNS:-}" ] || [ -n "${DNS_ENCRYPTED_SERVERS:-}" ] || [ "$proxy_all_dns" = "true" ]; then
         local proxy_flag=""
         local socks_ip socks_port socks_type
+        local want_dns_via_socks=false
+
+        if [ "$proxy_all_dns" = "true" ] || { [ -n "${DNS_ENCRYPTED_SERVERS:-}" ] && is_truthy "${DNS_ENCRYPTED_VIA_SOCKS:-false}"; }; then
+            want_dns_via_socks=true
+        fi
+
+        if [ "$want_dns_via_socks" = "true" ]; then
+            socks_ip="$(get_configured_socks_ip || true)"
+            socks_port="$(read_redsocks_value port)"
+            socks_type="$(read_redsocks_value type)"
+            if [ -n "$socks_ip" ] && [ "$socks_type" = "socks5" ]; then
+                upstream_block="${upstream_block}proxy-server socks5://${socks_ip}:${socks_port:-10808} -name env_socks"$'\n'
+                proxy_flag=" -proxy env_socks"
+            else
+                echo "Warning: DNS via SOCKS requested, but no active SOCKS5 proxy is configured; using direct DNS upstreams" >&2
+            fi
+        fi
 
         if [ -n "${DNS_ENCRYPTED_SERVERS:-}" ]; then
-            if is_truthy "${DNS_ENCRYPTED_VIA_SOCKS:-false}"; then
-                socks_ip="$(get_configured_socks_ip || true)"
-                socks_port="$(read_redsocks_value port)"
-                socks_type="$(read_redsocks_value type)"
-                if [ -n "$socks_ip" ] && [ "$socks_type" = "socks5" ]; then
-                    upstream_block="${upstream_block}proxy-server socks5://${socks_ip}:${socks_port:-10808} -name env_socks"$'\n'
-                    proxy_flag=" -proxy env_socks"
-                else
-                    echo "Warning: DNS_ENCRYPTED_VIA_SOCKS=true, but no active SOCKS5 proxy is configured; using direct DoH/DoT" >&2
-                fi
-            fi
-
             local bootstrap_ip="${UPSTREAM_DNS:-1.1.1.1}"
-            upstream_block="${upstream_block}server ${bootstrap_ip} -bootstrap-dns -exclude-default-group"$'\n'
+            if [ -n "$proxy_flag" ]; then
+                upstream_block="${upstream_block}server-tcp ${bootstrap_ip} -bootstrap-dns -exclude-default-group${proxy_flag}"$'\n'
+            else
+                upstream_block="${upstream_block}server ${bootstrap_ip} -bootstrap-dns -exclude-default-group"$'\n'
+            fi
 
             local srv
             while IFS= read -r srv; do
@@ -250,28 +288,17 @@ configure_smartdns_file() {
                 upstream_block="${upstream_block}server ${srv}${proxy_flag}"$'\n'
             done < <(tr ',' ' ' <<< "$DNS_ENCRYPTED_SERVERS" | tr -s '[:space:]' '\n')
         else
-            upstream_block="${upstream_block}server ${UPSTREAM_DNS}"$'\n'
+            local plain_dns="${UPSTREAM_DNS:-1.1.1.1}"
+            if [ -n "$proxy_flag" ]; then
+                upstream_block="${upstream_block}server-tcp ${plain_dns}${proxy_flag}"$'\n'
+            else
+                upstream_block="${upstream_block}server ${plain_dns}"$'\n'
+            fi
         fi
 
-        tmp_conf="$(mktemp)"
-        awk -v block="$upstream_block" '
-            BEGIN { in_block = 0; replaced = 0 }
-            /^# --- BEGIN UPSTREAMS/ {
-                print "# --- BEGIN UPSTREAMS (auto-managed when .env DNS vars are set) ---"
-                printf "%s", block
-                print "# --- END UPSTREAMS ---"
-                in_block = 1
-                replaced = 1
-                next
-            }
-            /^# --- END UPSTREAMS/ { in_block = 0; next }
-            !in_block { print }
-            END {
-                if (!replaced) {
-                    printf "\n# --- BEGIN UPSTREAMS (auto-managed when .env DNS vars are set) ---\n%s# --- END UPSTREAMS ---\n", block
-                }
-            }
-        ' "$SMARTDNS_CONF_FILE" > "$tmp_conf" && mv "$tmp_conf" "$SMARTDNS_CONF_FILE"
+        replace_smartdns_upstreams_block "$upstream_block"
+    elif grep -q ' -name env_socks$' "$SMARTDNS_CONF_FILE" 2>/dev/null; then
+        replace_smartdns_upstreams_block "server 1.1.1.1"$'\n'
     fi
 
     if [ -n "${PROXY_EXTRA_DOMAINS:-}" ]; then
@@ -358,9 +385,14 @@ setup_proxy_iptables() {
         iptables -A SPECIAL_PROXY_UDP -d "${socks_ip}/32" -j RETURN
     fi
 
-    # Redirect matched TCP traffic to redsocks and reject all UDP (including QUIC/WebRTC) to force TCP fallback
-    iptables -t nat -A SPECIAL_PROXY -p tcp -m set --match-set special_proxy dst -j REDIRECT --to-ports 12345
-    iptables -A SPECIAL_PROXY_UDP -p udp -m set --match-set special_proxy dst -j REJECT
+    # Redirect TCP traffic to redsocks and reject UDP (including QUIC/WebRTC) to force TCP fallback
+    if is_truthy "${PROXY_ALL:-false}"; then
+        iptables -t nat -A SPECIAL_PROXY -p tcp -j REDIRECT --to-ports 12345
+        iptables -A SPECIAL_PROXY_UDP -p udp -j REJECT
+    else
+        iptables -t nat -A SPECIAL_PROXY -p tcp -m set --match-set special_proxy dst -j REDIRECT --to-ports 12345
+        iptables -A SPECIAL_PROXY_UDP -p udp -m set --match-set special_proxy dst -j REJECT
+    fi
 
     # Skip SmartDNS traffic on OUTPUT (also when DNS_FORCE_REDIRECT=false); -m owner cannot be used inside PREROUTING chains
     iptables -t nat -I OUTPUT -p tcp -m owner ! --gid-owner "$SMARTDNS_GROUP" -j SPECIAL_PROXY
@@ -520,17 +552,20 @@ EOF
     # Снимаем старый DNS-перехват на случай повторного запуска скрипта до подъёма SmartDNS
     cleanup_dns_iptables
 
-    # --- Селективный прокси (redsocks + iptables, fail-closed при PROXY_ENABLED=true) ---
+    # --- Проксирование (redsocks + iptables, fail-closed при PROXY_ENABLED=true) ---
     if is_truthy "${PROXY_ENABLED:-true}"; then
         if ! configure_redsocks_file; then
             echo "Error: PROXY_ENABLED=true, but no SOCKS proxy is configured. Set SOCKS_PROXY_HOST in .env (or ip in redsocks.conf), or set PROXY_ENABLED=false." >&2
             return 1
         fi
-        local active_socks_ip active_socks_port active_socks_type
+        local active_socks_ip active_socks_port active_socks_type proxy_mode_label="selective"
         active_socks_ip="$(read_redsocks_value ip)"
         active_socks_port="$(read_redsocks_value port)"
         active_socks_type="$(read_redsocks_value type)"
-        log_info "Setting up selective proxy rules (${active_socks_type}://${active_socks_ip}:${active_socks_port}, ipset TTL: ${ipset_ttl}s, DNS TTL: ${dns_cache_ttl}s)..."
+        if is_truthy "${PROXY_ALL:-false}"; then
+            proxy_mode_label="all"
+        fi
+        log_info "Setting up proxy rules (mode: ${proxy_mode_label}, ${active_socks_type}://${active_socks_ip}:${active_socks_port}, ipset TTL: ${ipset_ttl}s, DNS TTL: ${dns_cache_ttl}s)..."
         setup_proxy_iptables "$ipset_ttl"
         redsocks -t -c "$REDSOCKS_CONF_FILE"
         if ! pgrep -x redsocks >/dev/null; then
@@ -545,10 +580,13 @@ EOF
             echo "Error: redsocks failed to start" >&2
             return 1
         fi
-        log_info "✓ Proxy rules and redsocks active"
+        log_info "✓ Proxy rules and redsocks active (mode: ${proxy_mode_label})"
     else
+        if is_truthy "${PROXY_ALL:-false}"; then
+            echo "Warning: PROXY_ALL=true is ignored because PROXY_ENABLED=false." >&2
+        fi
         cleanup_proxy_iptables
-        log_info "Selective proxy disabled (PROXY_ENABLED=false) — skipping redsocks/iptables"
+        log_info "Proxy disabled (PROXY_ENABLED=false) — skipping redsocks/iptables"
     fi
 
     # --- DNS (SmartDNS: читает smartdns.conf, либо применяет переменные из .env) ---
@@ -557,7 +595,7 @@ EOF
     if is_truthy "${VERBOSE_LOGS:-true}"; then
         local proxy_domains_count=0
         proxy_domains_count="$(grep -cE '^[[:space:]]*ipset[[:space:]]+/.+/special_proxy' "$SMARTDNS_CONF_FILE" || true)"
-        log_info "Starting SmartDNS (cache: ${DNS_CACHE_ENABLED:-true}, domains in special_proxy: ${proxy_domains_count})..."
+        log_info "Starting SmartDNS (cache: ${DNS_CACHE_ENABLED:-true}, proxy_all: ${PROXY_ALL:-false}, domains in special_proxy: ${proxy_domains_count})..."
     fi
     if ! pgrep -x smartdns >/dev/null; then
         setpriv --regid="$SMARTDNS_GROUP" --clear-groups smartdns -c "$SMARTDNS_CONF_FILE" -p "$SMARTDNS_PID_FILE"

@@ -15,9 +15,9 @@ Docker-окружение на базе `Ubuntu 24.04` для удалённой
   - При `DNS_FORCE_REDIRECT=true` (по умолчанию) запускается с отдельной группой `smartdns`: `iptables` заворачивает любые сторонние запросы `UDP/TCP 53` в локальный `SmartDNS` и блокирует обход через внешний `DoT/DoQ (853)` и известные публичные `DoH (443)`, оставляя самому `SmartDNS` полный доступ к апстримам и DoH/DoT.
   - Поддерживает обычный DNS (`server`), **DoH** (`https://...`), **DoT** (`tls://...`) и при необходимости маршрутизацию DoH/DoT через SOCKS5 (`DNS_ENCRYPTED_VIA_SOCKS=true`).
   - Если `UPSTREAM_DNS` и `DNS_ENCRYPTED_SERVERS` в `.env` не заданы, `SmartDNS` просто читает конфигурацию апстримов напрямую из `smartdns.conf`.
-- **Селективный прокси (`redsocks` + `iptables` + `ipset`):**
-  - `SmartDNS` добавляет IP для доменов из `smartdns.conf` (и `PROXY_EXTRA_DOMAINS`) в `ipset` `special_proxy`.
-  - `iptables` заворачивает TCP-трафик для IP из `special_proxy` в `redsocks` (`127.0.0.1:12345`) в обход локальных подсетей и блокирует (`REJECT`) весь исходящий `UDP` (QUIC, WebRTC и др.) к этим IP, исключая утечки мимо SOCKS.
+- **Проксирование (`redsocks` + `iptables` + `ipset`):**
+  - По умолчанию (`PROXY_ALL=false`) работает селективно: `SmartDNS` добавляет IP для доменов из `smartdns.conf` (и `PROXY_EXTRA_DOMAINS`) в `ipset` `special_proxy`, `iptables` заворачивает TCP для этих IP в `redsocks` (`127.0.0.1:12345`) в обход локальных подсетей и блокирует (`REJECT`) исходящий `UDP` к ним.
+  - При `PROXY_ALL=true` весь внешний TCP-трафик контейнера (включая прямые подключения по IP) заворачивается в `redsocks`, весь внешний `UDP` режется (`REJECT`), а DNS-апстримы `SmartDNS` (при `socks5`) автоматически маршрутизируются через этот же SOCKS по TCP.
   - IPv6 полностью блокируется в контейнере через `sysctls` и `ip6tables` (`IPV6_BLOCK`), чтобы трафик не обходил правила IPv4.
   - Работает в режиме **fail-closed**: если `PROXY_ENABLED=true`, но `SOCKS_PROXY_HOST` (или `ip` в `redsocks.conf`) не настроен либо `redsocks` не запустился, контейнер завершается с ошибкой вместо тихого пропуска трафика напрямую.
 - **Логирование (`VERBOSE_LOGS`):**
@@ -58,7 +58,8 @@ Docker-окружение на базе `Ubuntu 24.04` для удалённой
 | `IPSET_TTL` | `3600` | Время жизни (в секундах) IP-адресов в `ipset special_proxy` (независимо от `DNS_CACHE_TTL`) |
 | `DNS_FORCE_REDIRECT` | `true` | Принудительный заворот `UDP/TCP 53` в `SmartDNS` и блокировка обхода через внешний `DoT (853)` / публичные `DoH` |
 | `PROXY_EXTRA_DOMAINS` | *(пусто)* | Дополнительные домены для `special_proxy` через запятую |
-| `PROXY_ENABLED` | `true` | Включение селективного проксирования (`true` / `false`; при `true` требует валидный прокси — *fail-closed*) |
+| `PROXY_ENABLED` | `true` | Включение проксирования (`true` / `false`; при `true` требует валидный прокси — *fail-closed*) |
+| `PROXY_ALL` | `false` | Проксировать весь внешний TCP и DNS через SOCKS и резать весь внешний UDP (`true` / `false`) |
 | `SOCKS_PROXY_HOST` | *(пусто)* | IP или хостнейм прокси-сервера для `redsocks` (обязателен при `PROXY_ENABLED=true`, если не задан в `redsocks.conf`) |
 | `SOCKS_PROXY_PORT` | `10808` | Порт прокси-сервера для `redsocks` |
 | `SOCKS_PROXY_TYPE` | `socks5` | Тип прокси в `redsocks` (`socks5`, `socks4`, `http-connect`) |
