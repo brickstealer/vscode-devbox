@@ -518,9 +518,16 @@ main() {
         printf '%s\n' "$TZ" > /etc/timezone
     fi
 
+    local dotnet_root="/usr/lib/dotnet"
+    if command -v dotnet >/dev/null 2>&1; then
+        dotnet_root="$(dirname "$(readlink -f "$(command -v dotnet)")")"
+    elif [ -d /usr/share/dotnet ]; then
+        dotnet_root="/usr/share/dotnet"
+    fi
+
     cat <<EOF > /etc/environment
-PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/share/dotnet:/home/dev/.dotnet/tools"
-DOTNET_ROOT="/usr/share/dotnet"
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${dotnet_root}:/home/dev/.dotnet/tools"
+DOTNET_ROOT="${dotnet_root}"
 DOTNET_CLI_TELEMETRY_OPTOUT="1"
 NVM_DIR="/home/dev/.nvm"
 NODE_OPTIONS="--dns-result-order=ipv4first"

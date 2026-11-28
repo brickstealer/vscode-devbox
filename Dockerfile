@@ -1,9 +1,10 @@
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    DOTNET_ROOT=/usr/share/dotnet \
+    DOTNET_ROOT=/usr/lib/dotnet \
     DOTNET_CLI_TELEMETRY_OPTOUT=1 \
-    NVM_DIR=/home/dev/.nvm
+    NVM_DIR=/home/dev/.nvm \
+    PATH="/usr/lib/dotnet:/home/dev/.dotnet/tools:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-server \
@@ -24,6 +25,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -f /tmp/packages-microsoft-prod.deb \
     && apt-get update \
     && apt-get install -y --no-install-recommends dotnet-sdk-10.0 \
+    && REAL_DOTNET_ROOT="$(dirname "$(readlink -f "$(command -v dotnet)")")" \
+    && if [ "$REAL_DOTNET_ROOT" != "/usr/share/dotnet" ] && [ ! -e /usr/share/dotnet ]; then \
+        ln -s "$REAL_DOTNET_ROOT" /usr/share/dotnet; \
+    fi \
+    && if [ "$REAL_DOTNET_ROOT" != "/usr/lib/dotnet" ] && [ ! -e /usr/lib/dotnet ]; then \
+        ln -s "$REAL_DOTNET_ROOT" /usr/lib/dotnet; \
+    fi \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /run/sshd
 
@@ -52,13 +60,14 @@ RUN mkdir -p /opt/nvm-seed \
     && chown -R dev:dev /opt/nvm-seed
 
 # Прописываем nvm и dotnet в .bashrc для интерактивных терминалов
-RUN cat <<'EOF' >> /home/dev/.bashrc
+RUN REAL_DOTNET_ROOT="$(dirname "$(readlink -f "$(command -v dotnet)")")" && cat <<EOF >> /home/dev/.bashrc
 
-export DOTNET_ROOT=/usr/share/dotnet
+export DOTNET_ROOT=${REAL_DOTNET_ROOT}
 export DOTNET_CLI_TELEMETRY_OPTOUT=1
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
+export PATH="\$DOTNET_ROOT:\$HOME/.dotnet/tools:\$PATH"
+export NVM_DIR="\$HOME/.nvm"
+[ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh"
+[ -s "\$NVM_DIR/bash_completion" ] && \. "\$NVM_DIR/bash_completion"
 EOF
 
 # Сетевой стек отдельным слоем, чтобы не инвалидировать кэш .NET и nvm
